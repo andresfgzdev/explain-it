@@ -1,0 +1,23 @@
+{
+  "name": "explain-it",
+  "version": "0.1.0",
+  "description": "Explains complex software architectures, multi-hop integrations, and code flows in strict ASD-STE100 (Simplified Technical English) with an interactive software machine schematic.",
+  "type": "module",
+  "main": "skills/explain-it/scripts/render-schematic.mjs",
+  "scripts": {
+    "test": "node tests/run-tests.mjs",
+    "lint:ste100": "node skills/explain-it/scripts/ste100-lint.mjs",
+    "demo": "node skills/explain-it/scripts/render-schematic.mjs --fixture tests/fixtures/sample-flow.json --out dist/demo-schematic.html"
+  },
+  "keywords": [
+    "claude-skill",
+    "agent-skill",
+    "asd-ste100",
+    "simplified-technical-english",
+    "software-architecture",
+    "schematic-generator",
+    "interactive-visualizer"
+  ],
+  "author": "Andres Gallego",
+  "license": "MIT"
+}

@@ -1,0 +1,18 @@
+{
+  "name": "explain-it",
+  "description": "explain-it: trace and explain software systems in strict ASD-STE100 with interactive software machine schematics",
+  "owner": {
+    "name": "Andres Gallego",
+    "url": "https://github.com/andresfgzdev"
+  },
+  "plugins": [
+    {
+      "name": "explain-it",
+      "source": {
+        "source": "github",
+        "repo": "andresfgzdev/explain-it"
+      },
+      "description": "Multi-hop code tracing, ASD-STE100 technical explanations (Low, Medium, High), and interactive software schematics"
+    }
+  ]
+}

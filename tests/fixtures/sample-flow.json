@@ -1,0 +1,145 @@
+{
+  "title": "Salesforce Lead Ingestion & Database Sync",
+  "concept": "How the webhook endpoint processes and syncs leads from Salesforce",
+  "theme": "blueprint",
+  "scenarios": [
+    {
+      "id": "success",
+      "name": "200 Success",
+      "description": "Valid signature and clean payload"
+    },
+    {
+      "id": "err_auth",
+      "name": "401 Signature Error",
+      "description": "HMAC signature mismatch on inbound webhook"
+    },
+    {
+      "id": "err_validation",
+      "name": "422 Missing Fields",
+      "description": "Email or company name is empty"
+    },
+    {
+      "id": "err_timeout",
+      "name": "504 Database Timeout",
+      "description": "PostgreSQL pool connection timeout"
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node-sf",
+      "label": "Salesforce CRM",
+      "sub": "External SaaS / Webhook Dispatcher",
+      "type": "ingress",
+      "codeRef": "https://developer.salesforce.com/docs",
+      "ste100": {
+        "low": "Salesforce dispatches lead updates.",
+        "med": "Salesforce sends a POST request with lead data when a record changes.",
+        "high": "Salesforce triggers an Outbound Webhook when an agent updates a lead record. The message contains the lead identifier, company name, and status code."
+      },
+      "validations": [
+        "Inbound webhook uses HTTPS",
+        "Payload includes X-Salesforce-Signature header"
+      ],
+      "payload": {
+        "event": "lead_update",
+        "leadId": "00Q5g00000abc123",
+        "status": "Qualified",
+        "company": "Acme Corp"
+      },
+      "edgeCases": "Salesforce retries delivery 3 times with exponential backoff if the endpoint returns a 5xx response code."
+    },
+    {
+      "id": "node-auth",
+      "label": "Auth Interlock",
+      "sub": "HMAC SHA-256 Verification",
+      "type": "interlock",
+      "codeRef": "src/middleware/verify-signature.ts:18",
+      "ste100": {
+        "low": "The server checks the signature.",
+        "med": "The gateway verifies the HMAC signature before it parses the body.",
+        "high": "The security middleware computes the HMAC SHA-256 hash of the raw request body. The server compares this hash to the signature header using a timing-safe equality check."
+      },
+      "validations": [
+        "Timing-safe signature comparison",
+        "Timestamp within 300 seconds window to prevent replay attacks"
+      ],
+      "payload": {
+        "signatureValid": true,
+        "clockSkewSeconds": 4
+      },
+      "edgeCases": "If the signature does not match, the gateway drops the connection immediately and returns HTTP 401 Unauthorized."
+    },
+    {
+      "id": "node-validator",
+      "label": "Zod Schema Gate",
+      "sub": "Payload Contract Validation",
+      "type": "interlock",
+      "codeRef": "src/schemas/lead-schema.ts:12",
+      "ste100": {
+        "low": "The schema check verifies the data.",
+        "med": "Zod validates required fields and formats.",
+        "high": "The schema validator parses the JSON body against the lead schema. It confirms that the lead identifier matches the standard 18-character format and that the email address is valid."
+      },
+      "validations": [
+        "leadId matches regex /^00Q[a-zA-Z0-9]{15}$/",
+        "company name string length between 2 and 120 characters",
+        "status matches approved enum values"
+      ],
+      "payload": {
+        "schemaPass": true,
+        "coercedFields": ["email"]
+      },
+      "edgeCases": "If any required field is missing, the validator returns HTTP 422 with an array of field errors."
+    },
+    {
+      "id": "node-worker",
+      "label": "Sync Processor",
+      "sub": "Data Transformation & Normalization",
+      "type": "processor",
+      "codeRef": "src/services/lead-sync.service.ts:45",
+      "ste100": {
+        "low": "The service updates the local record.",
+        "med": "The worker normalizes lead properties and schedules an account lookup.",
+        "high": "The synchronization service extracts the normalized properties. It transforms the Salesforce status code to the internal system state and maps custom metadata fields."
+      },
+      "validations": [
+        "Idempotency key check against Redis cache",
+        "Country code normalization to ISO-3166-1 alpha-2"
+      ],
+      "payload": {
+        "internalId": "lead_9921",
+        "normalizedStatus": "ACTIVE_QUALIFIED",
+        "isDuplicate": false
+      },
+      "edgeCases": "If a sync job for the same leadId is already running, the service defers execution using an advisory lock."
+    },
+    {
+      "id": "node-db",
+      "label": "PostgreSQL Vault",
+      "sub": "Database Persistence & Audit Log",
+      "type": "egress",
+      "codeRef": "src/db/repositories/leads.repo.ts:88",
+      "ste100": {
+        "low": "The database saves the record.",
+        "med": "Prisma saves the lead and creates an audit record.",
+        "high": "The database repository runs an upsert query inside a transaction. It updates the lead record and inserts an immutable audit log entry."
+      },
+      "validations": [
+        "Foreign key integrity check on organization_id",
+        "Unique constraint on external_salesforce_id"
+      ],
+      "payload": {
+        "dbOperation": "UPSERT",
+        "rowsAffected": 2,
+        "transactionId": "tx_88129a0b"
+      },
+      "edgeCases": "If the database connection pool exhausts, the repository rejects the promise and triggers a dead-letter queue backup."
+    }
+  ],
+  "connections": [
+    { "from": "node-sf", "to": "node-auth" },
+    { "from": "node-auth", "to": "node-validator" },
+    { "from": "node-validator", "to": "node-worker" },
+    { "from": "node-worker", "to": "node-db" }
+  ]
+}

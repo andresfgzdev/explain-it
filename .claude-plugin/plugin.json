@@ -1,0 +1,19 @@
+{
+  "name": "explain-it",
+  "displayName": "explain-it",
+  "version": "0.1.0",
+  "description": "Explains software systems and multi-hop data flows in strict ASD-STE100 (Simplified Technical English) with a tactile, interactive software machine schematic.",
+  "author": {
+    "name": "Andres Gallego",
+    "url": "https://github.com/andresfgzdev"
+  },
+  "repository": "https://github.com/andresfgzdev/explain-it",
+  "homepage": "https://github.com/andresfgzdev/explain-it",
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "explain-it",
+      "description": "Trace and explain an architecture, multi-system flow, or code connection in ASD-STE100 with interactive visual schematics"
+    }
+  ]
+}
