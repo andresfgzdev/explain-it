@@ -37,6 +37,18 @@ Each approved word has only one grammatical category and one meaning. Avoid syno
 | as well as | **and** | Use simple conjunctions. |
 | subsequent to | **after** | Avoid formal multi-word prepositions. |
 | prior to | **before** | Clear time sequence. |
+| in the event that | **if** | Use the simple conditional. |
+| is able to, are able to | **can** | Use the modal verb. |
+| ensure | **make sure** | Direct instruction. |
+| facilitate, assist | **help** | Direct verb. |
+| commence | **start** | Same as initiate. |
+| retrieve | **get** | Same as obtain. |
+| via | **through** | Use a plain preposition. |
+| numerous, a number of | **many**, **some** | Simple quantity words. |
+| approximately | **about** | Simple quantity word. |
+| sufficient, additional | **enough**, **more** | Simple quantity words. |
+
+`scripts/ste100-lint.mjs` checks the words in this table and their inflections (for example *utilizes*, *performed*, *displaying*). It does not flag words that are also common API names (*trigger*, *fetch*, *emit*, *generate*, *spawn*, *kill*, *abort*). Avoid them in prose anyway. It also flags passive voice with or without "by" (*is validated*, *was sent*). It warns on more than 3 nouns in a row.
 
 ### Rule 4: Noun Clusters
 Limit noun sequences to a maximum of **three consecutive nouns**. Break longer sequences with prepositions.
