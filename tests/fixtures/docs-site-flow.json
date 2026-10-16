@@ -1,0 +1,270 @@
+{
+  "title": "Static Docs Site: How Everything Connects",
+  "concept": "A complete human-first walkthrough of how content, validation, layout, and transitions work together",
+  "scenarios": [
+    {
+      "id": "full_journey",
+      "name": "Complete Visitor Journey",
+      "description": "From typing content on disk to interactive browser reading",
+      "path": [
+        "node-mdx",
+        "node-zod",
+        "node-catalogue",
+        "node-next",
+        "node-shell",
+        "node-transitions",
+        "node-toc"
+      ]
+    },
+    {
+      "id": "instant_nav",
+      "name": "Zero-Loading Navigation",
+      "description": "How React 19 ViewTransitions eliminate loading skeletons",
+      "path": [
+        "node-next",
+        "node-shell",
+        "node-transitions",
+        "node-toc"
+      ]
+    },
+    {
+      "id": "content_guard",
+      "name": "Content Safety Check",
+      "description": "How Zod prevents broken markdown from ever deploying",
+      "path": [
+        "node-mdx",
+        "node-zod",
+        "node-build-fail"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node-mdx",
+      "label": "1. Content on Disk",
+      "sub": "Local Markdown & MDX Files",
+      "type": "ingress",
+      "codeRef": "content/docs/*.mdx",
+      "story": "Think of this as your filing cabinet. You write every page as a plain Markdown file on your local drive. There is no external database like MongoDB or PostgreSQL. Your files are your database.",
+      "ste100": {
+        "low": "The system stores all content in local markdown files.",
+        "med": "Fumadocs reads markdown files from the content directory during build time.",
+        "high": "The content engine reads local markdown and MDX files for guides, reference pages, and changelog entries. Content authors write entries in local files without a remote database."
+      },
+      "validations": [
+        "Files must reside in content/ directory",
+        "Must use .mdx or .json extensions"
+      ],
+      "payload": {
+        "sourceDirectory": "content/",
+        "filesDetected": 24,
+        "format": "MDX + Frontmatter"
+      },
+      "edgeCases": "If a file is saved in the wrong directory, Fumadocs skips it and does not include it in the build."
+    },
+    {
+      "id": "node-zod",
+      "label": "2. The Gatekeeper",
+      "sub": "Zod Schema Validation",
+      "type": "interlock",
+      "codeRef": "src/lib/content-schemas.ts:24",
+      "story": "Before any file is allowed onto the website, this security guard inspects every single field. It checks: Is the file name kebab-case? Is the title present? Are the dates formatted correctly? If one rule fails, it stops the build immediately so broken content never goes live.",
+      "ste100": {
+        "low": "Zod validates every frontmatter field.",
+        "med": "Zod checks that all titles, dates, and descriptions follow strict schemas.",
+        "high": "The schema validator parses raw frontmatter into typed objects. It confirms kebab-case file names, validates ISO date formats, and verifies that every page has a title and a description."
+      },
+      "validations": [
+        "File name must match kebab-case regex",
+        "Page description must not exceed 160 characters",
+        "Every page needs a title and a description"
+      ],
+      "payload": {
+        "validationGate": "ZOD_SCHEMA_CHECK",
+        "status": "APPROVED",
+        "schemaErrors": 0
+      },
+      "edgeCases": "If you misspell a field or forget a required value, the build throws a clear error and prevents deployment."
+    },
+    {
+      "id": "node-catalogue",
+      "label": "3. The In-Memory Brain",
+      "sub": "Pre-Computed Catalogue Store",
+      "type": "processor",
+      "codeRef": "src/modules/content/catalogue.ts:18",
+      "story": "Once all files pass inspection, the catalogue memorizes the entire site into computer RAM. It calculates reading times and pre-links 'Previous' and 'Next' buttons for every page. Because everything lives in memory, looking up any page takes 0 milliseconds.",
+      "ste100": {
+        "low": "The catalogue stores the validated items in memory.",
+        "med": "The catalogue module indexes routes and resolves adjacent pagination links.",
+        "high": "The catalogue module compiles all validated records into an in-memory graph. It computes reading times, groups pages by section, and connects previous and next items for instant pagination."
+      },
+      "validations": [
+        "Duplicate slug check across all collections",
+        "No circular pagination links on first and last entries"
+      ],
+      "payload": {
+        "lookupSpeed": "0ms (In-Memory)",
+        "sectionsIndexed": [
+          "guides",
+          "reference",
+          "changelog"
+        ],
+        "totalIndexedRoutes": 18
+      },
+      "edgeCases": "If two markdown files share the same slug, the catalogue throws a duplicate error to prevent broken links."
+    },
+    {
+      "id": "node-next",
+      "label": "4. Next.js Server Engine",
+      "sub": "Next.js 16 Server Components",
+      "type": "processor",
+      "codeRef": "src/app/layout.tsx:22",
+      "story": "Next.js takes the data from the in-memory brain and turns it into clean, fast HTML before sending it to the visitor. It loads the site fonts, creates search metadata tags, and streams the finished page with maximum speed.",
+      "ste100": {
+        "low": "Next.js compiles the route into HTML.",
+        "med": "Next.js matches the URL, injects font variables, and streams HTML to the browser.",
+        "high": "The Next.js 16 App Router maps the requested URL to Server Components. It generates dynamic metadata, applies the site fonts, and streams pre-rendered HTML to the visitor."
+      },
+      "validations": [
+        "Canonical URL generation against siteUrl",
+        "Pre-rendering with zero runtime database queries"
+      ],
+      "payload": {
+        "engine": "Next.js 16.4.0 (App Router)",
+        "renderingMode": "Static Generation (SSG)",
+        "fontsInjected": [
+          "Inter",
+          "JetBrains Mono"
+        ]
+      },
+      "edgeCases": "If a visitor types a URL that does not exist, Next.js renders not-found.tsx with a helpful back link."
+    },
+    {
+      "id": "node-shell",
+      "label": "5. The 1400px Frame",
+      "sub": "SiteShell & Docs-Style Grid",
+      "type": "processor",
+      "codeRef": "src/modules/shell/site-shell.tsx:12",
+      "story": "This is the visual house of your website. It creates the documentation layout: a fixed left sidebar with your navigation, a slim top header, and locks the maximum width to 1400 pixels so the site looks balanced and beautiful on widescreen monitors.",
+      "ste100": {
+        "low": "SiteShell frames the page with a sidebar and header.",
+        "med": "SiteShell positions the left sidebar and restricts the inner container width.",
+        "high": "SiteShell constructs the three-zone documentation layout. It shows a sticky navigation bar on the left and a header at the top. It locks the main container to a maximum width of 1400px."
+      },
+      "validations": [
+        "Maximum inner container width locked to 1400px",
+        "Left sidebar hidden on mobile screens to save space"
+      ],
+      "payload": {
+        "layoutType": "three-zone-docs",
+        "maxWidth": "1400px",
+        "sidebarStatus": "Sticky Desktop"
+      },
+      "edgeCases": "On mobile phones, the desktop sidebar hides automatically, and a touch-friendly slide-over drawer takes its place."
+    },
+    {
+      "id": "node-transitions",
+      "label": "6. Zero-Loading Engine",
+      "sub": "React 19 ViewTransitions",
+      "type": "processor",
+      "codeRef": "src/modules/shell/page-layout.tsx:9",
+      "story": "When a visitor clicks from Home to Guides, normal websites flash a white screen or show a spinning loader. This engine uses React 19's native ViewTransition to swap pages instantly and fluidly with zero skeletons and zero delay.",
+      "ste100": {
+        "low": "React 19 transitions provide instant page switches.",
+        "med": "PageLayout uses React 19 ViewTransition to replace content without skeletons.",
+        "high": "PageLayout wraps every page in a React 19 ViewTransition element. When the user navigates, the browser crossfades views smoothly without loading spinners or skeleton placeholder screens."
+      },
+      "validations": [
+        "Zero loading spinners allowed anywhere on the site",
+        "Lighthouse performance target of 100"
+      ],
+      "payload": {
+        "transitionEngine": "React 19 ViewTransition",
+        "exitAnimation": "page-out",
+        "skeletonScreens": "NONE"
+      },
+      "edgeCases": "If a visitor has a slower network, the page still switches smoothly because all HTML and assets are pre-rendered."
+    },
+    {
+      "id": "node-toc",
+      "label": "7. The Live Compass",
+      "sub": "Right Rail TOC & Scroll Observer",
+      "type": "egress",
+      "codeRef": "src/modules/toc/on-this-page.tsx:28",
+      "story": "As the visitor reads down a long guide, an invisible sensor watches which heading they are looking at. It highlights the exact bullet point in the right rail and quietly updates the URL without refreshing the page.",
+      "ste100": {
+        "low": "The right rail tracks the active section as you scroll.",
+        "med": "An IntersectionObserver watches headings and highlights the active link.",
+        "high": "The right rail navigator uses an IntersectionObserver to monitor section headings during scroll. It updates the active pill indicator and synchronizes the URL hash quietly without refreshing the page."
+      },
+      "validations": [
+        "Headings must contain unique anchor identifiers",
+        "Offset calculation must account for the sticky header"
+      ],
+      "payload": {
+        "activeSection": "#installation",
+        "trackingMethod": "IntersectionObserver",
+        "smoothScroll": "ENABLED"
+      },
+      "edgeCases": "If the user has reduced-motion enabled in their operating system, smooth scrolling switches to instant jumps."
+    },
+    {
+      "id": "node-build-fail",
+      "label": "Build Stopped",
+      "sub": "Schema Error Report",
+      "type": "error",
+      "codeRef": "src/lib/content-schemas.ts:61",
+      "story": "If a content file breaks a rule, the build stops right here. You get a clear message that names the file and the field, and the broken page never reaches visitors.",
+      "ste100": {
+        "low": "The build stops on bad content.",
+        "med": "Zod stops the build and shows the file name and the failed field.",
+        "high": "The schema validator stops the build process with a non-zero exit code. The error message names the file path, the field, and the expected format."
+      },
+      "validations": [],
+      "payload": {
+        "exitCode": 1,
+        "file": "content/docs/getting-started.mdx",
+        "field": "description",
+        "expected": "string (max 160 chars)"
+      },
+      "edgeCases": "The deploy platform keeps the last good version online while you fix the file."
+    }
+  ],
+  "connections": [
+    {
+      "from": "node-mdx",
+      "to": "node-zod",
+      "label": "Raw Files"
+    },
+    {
+      "from": "node-zod",
+      "to": "node-catalogue",
+      "label": "Validated Data"
+    },
+    {
+      "from": "node-catalogue",
+      "to": "node-next",
+      "label": "In-Memory Graph"
+    },
+    {
+      "from": "node-next",
+      "to": "node-shell",
+      "label": "HTML Stream"
+    },
+    {
+      "from": "node-shell",
+      "to": "node-transitions",
+      "label": "Docs Frame"
+    },
+    {
+      "from": "node-transitions",
+      "to": "node-toc",
+      "label": "Live Client DOM"
+    },
+    {
+      "from": "node-zod",
+      "to": "node-build-fail",
+      "label": "Invalid frontmatter"
+    }
+  ]
+}

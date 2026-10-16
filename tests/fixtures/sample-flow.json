@@ -1,27 +1,52 @@
 {
   "title": "Salesforce Lead Ingestion & Database Sync",
   "concept": "How the webhook endpoint processes and syncs leads from Salesforce",
-  "theme": "blueprint",
   "scenarios": [
     {
       "id": "success",
       "name": "200 Success",
-      "description": "Valid signature and clean payload"
+      "description": "Valid signature and clean payload",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "node-worker",
+        "node-db"
+      ]
     },
     {
       "id": "err_auth",
       "name": "401 Signature Error",
-      "description": "HMAC signature mismatch on inbound webhook"
+      "description": "HMAC signature mismatch on inbound webhook",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "err-401"
+      ]
     },
     {
       "id": "err_validation",
       "name": "422 Missing Fields",
-      "description": "Email or company name is empty"
+      "description": "Email or company name is empty",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "err-422"
+      ]
     },
     {
       "id": "err_timeout",
       "name": "504 Database Timeout",
-      "description": "PostgreSQL pool connection timeout"
+      "description": "PostgreSQL pool connection timeout",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "node-worker",
+        "node-db",
+        "err-504"
+      ]
     }
   ],
   "nodes": [
@@ -87,7 +112,9 @@
       ],
       "payload": {
         "schemaPass": true,
-        "coercedFields": ["email"]
+        "coercedFields": [
+          "email"
+        ]
       },
       "edgeCases": "If any required field is missing, the validator returns HTTP 422 with an array of field errors."
     },
@@ -134,12 +161,106 @@
         "transactionId": "tx_88129a0b"
       },
       "edgeCases": "If the database connection pool exhausts, the repository rejects the promise and triggers a dead-letter queue backup."
+    },
+    {
+      "id": "err-401",
+      "label": "401 Unauthorized",
+      "sub": "Signature Rejection",
+      "type": "error",
+      "codeRef": "src/middleware/verify-signature.ts:31",
+      "ste100": {
+        "low": "The server rejects the request.",
+        "med": "The gateway stops the request and returns HTTP 401.",
+        "high": "The middleware stops the request before the parser reads the body. It returns HTTP 401 and writes the source IP address to the security log."
+      },
+      "validations": [
+        "No body parsing after a signature mismatch"
+      ],
+      "payload": {
+        "status": 401,
+        "error": "INVALID_SIGNATURE"
+      },
+      "edgeCases": "Salesforce does not retry a 4xx response, so an operator must fix the shared secret."
+    },
+    {
+      "id": "err-422",
+      "label": "422 Validation Error",
+      "sub": "Field Error Response",
+      "type": "error",
+      "codeRef": "src/schemas/lead-schema.ts:40",
+      "ste100": {
+        "low": "The server returns field errors.",
+        "med": "The validator returns HTTP 422 with a list of field errors.",
+        "high": "The validator collects all failed fields into one array. The gateway returns HTTP 422 with this array, and the worker does not get the job."
+      },
+      "validations": [],
+      "payload": {
+        "status": 422,
+        "errors": [
+          {
+            "path": "company",
+            "message": "Required"
+          }
+        ]
+      },
+      "edgeCases": "The response lists every failed field, so the sender can fix all errors in one change."
+    },
+    {
+      "id": "err-504",
+      "label": "504 Timeout & DLQ",
+      "sub": "Dead-Letter Queue Backup",
+      "type": "error",
+      "codeRef": "src/queues/dead-letter.ts:14",
+      "ste100": {
+        "low": "The system saves the failed job for later.",
+        "med": "The repository puts the failed job into the dead-letter queue.",
+        "high": "The repository stops the transaction after 5 seconds. It puts the job into the dead-letter queue, and the gateway returns HTTP 504."
+      },
+      "validations": [
+        "Retry count below 5"
+      ],
+      "payload": {
+        "status": 504,
+        "dlqMessageId": "dlq_51f0"
+      },
+      "edgeCases": "A scheduled worker reads the dead-letter queue every 10 minutes and tries the job again."
     }
   ],
   "connections": [
-    { "from": "node-sf", "to": "node-auth" },
-    { "from": "node-auth", "to": "node-validator" },
-    { "from": "node-validator", "to": "node-worker" },
-    { "from": "node-worker", "to": "node-db" }
+    {
+      "from": "node-sf",
+      "to": "node-auth",
+      "label": "POST /webhooks/lead"
+    },
+    {
+      "from": "node-auth",
+      "to": "node-validator",
+      "label": "Verified body"
+    },
+    {
+      "from": "node-validator",
+      "to": "node-worker",
+      "label": "Typed lead"
+    },
+    {
+      "from": "node-worker",
+      "to": "node-db",
+      "label": "Upsert"
+    },
+    {
+      "from": "node-auth",
+      "to": "err-401",
+      "label": "Bad signature"
+    },
+    {
+      "from": "node-validator",
+      "to": "err-422",
+      "label": "Schema errors"
+    },
+    {
+      "from": "node-db",
+      "to": "err-504",
+      "label": "Pool timeout"
+    }
   ]
 }

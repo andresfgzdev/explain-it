@@ -1,0 +1,266 @@
+{
+  "title": "Salesforce Lead Ingestion & Database Sync",
+  "concept": "How the webhook endpoint processes and syncs leads from Salesforce",
+  "scenarios": [
+    {
+      "id": "success",
+      "name": "200 Success",
+      "description": "Valid signature and clean payload",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "node-worker",
+        "node-db"
+      ]
+    },
+    {
+      "id": "err_auth",
+      "name": "401 Signature Error",
+      "description": "HMAC signature mismatch on inbound webhook",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "err-401"
+      ]
+    },
+    {
+      "id": "err_validation",
+      "name": "422 Missing Fields",
+      "description": "Email or company name is empty",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "err-422"
+      ]
+    },
+    {
+      "id": "err_timeout",
+      "name": "504 Database Timeout",
+      "description": "PostgreSQL pool connection timeout",
+      "path": [
+        "node-sf",
+        "node-auth",
+        "node-validator",
+        "node-worker",
+        "node-db",
+        "err-504"
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "node-sf",
+      "label": "Salesforce CRM",
+      "sub": "External SaaS / Webhook Dispatcher",
+      "type": "ingress",
+      "codeRef": "https://developer.salesforce.com/docs",
+      "ste100": {
+        "low": "Salesforce dispatches lead updates.",
+        "med": "Salesforce sends a POST request with lead data when a record changes.",
+        "high": "Salesforce triggers an Outbound Webhook when an agent updates a lead record. The message contains the lead identifier, company name, and status code."
+      },
+      "validations": [
+        "Inbound webhook uses HTTPS",
+        "Payload includes X-Salesforce-Signature header"
+      ],
+      "payload": {
+        "event": "lead_update",
+        "leadId": "00Q5g00000abc123",
+        "status": "Qualified",
+        "company": "Acme Corp"
+      },
+      "edgeCases": "Salesforce retries delivery 3 times with exponential backoff if the endpoint returns a 5xx response code."
+    },
+    {
+      "id": "node-auth",
+      "label": "Auth Interlock",
+      "sub": "HMAC SHA-256 Verification",
+      "type": "interlock",
+      "codeRef": "src/middleware/verify-signature.ts:18",
+      "ste100": {
+        "low": "The server checks the signature.",
+        "med": "The gateway verifies the HMAC signature before it parses the body.",
+        "high": "The security middleware computes the HMAC SHA-256 hash of the raw request body. The server compares this hash to the signature header using a timing-safe equality check."
+      },
+      "validations": [
+        "Timing-safe signature comparison",
+        "Timestamp within 300 seconds window to prevent replay attacks"
+      ],
+      "payload": {
+        "signatureValid": true,
+        "clockSkewSeconds": 4
+      },
+      "edgeCases": "If the signature does not match, the gateway drops the connection immediately and returns HTTP 401 Unauthorized."
+    },
+    {
+      "id": "node-validator",
+      "label": "Zod Schema Gate",
+      "sub": "Payload Contract Validation",
+      "type": "interlock",
+      "codeRef": "src/schemas/lead-schema.ts:12",
+      "ste100": {
+        "low": "The schema check verifies the data.",
+        "med": "Zod validates required fields and formats.",
+        "high": "The schema validator parses the JSON body against the lead schema. It confirms that the lead identifier matches the standard 18-character format and that the email address is valid."
+      },
+      "validations": [
+        "leadId matches regex /^00Q[a-zA-Z0-9]{15}$/",
+        "company name string length between 2 and 120 characters",
+        "status matches approved enum values"
+      ],
+      "payload": {
+        "schemaPass": true,
+        "coercedFields": [
+          "email"
+        ]
+      },
+      "edgeCases": "If any required field is missing, the validator returns HTTP 422 with an array of field errors."
+    },
+    {
+      "id": "node-worker",
+      "label": "Sync Processor",
+      "sub": "Data Transformation & Normalization",
+      "type": "processor",
+      "codeRef": "src/services/lead-sync.service.ts:45",
+      "ste100": {
+        "low": "The service updates the local record.",
+        "med": "The worker normalizes lead properties and schedules an account lookup.",
+        "high": "The synchronization service extracts the normalized properties. It transforms the Salesforce status code to the internal system state and maps custom metadata fields."
+      },
+      "validations": [
+        "Idempotency key check against Redis cache",
+        "Country code normalization to ISO-3166-1 alpha-2"
+      ],
+      "payload": {
+        "internalId": "lead_9921",
+        "normalizedStatus": "ACTIVE_QUALIFIED",
+        "isDuplicate": false
+      },
+      "edgeCases": "If a sync job for the same leadId is already running, the service defers execution using an advisory lock."
+    },
+    {
+      "id": "node-db",
+      "label": "PostgreSQL Vault",
+      "sub": "Database Persistence & Audit Log",
+      "type": "egress",
+      "codeRef": "src/db/repositories/leads.repo.ts:88",
+      "ste100": {
+        "low": "The database saves the record.",
+        "med": "Prisma saves the lead and creates an audit record.",
+        "high": "The database repository runs an upsert query inside a transaction. It updates the lead record and inserts an immutable audit log entry."
+      },
+      "validations": [
+        "Foreign key integrity check on organization_id",
+        "Unique constraint on external_salesforce_id"
+      ],
+      "payload": {
+        "dbOperation": "UPSERT",
+        "rowsAffected": 2,
+        "transactionId": "tx_88129a0b"
+      },
+      "edgeCases": "If the database connection pool exhausts, the repository rejects the promise and triggers a dead-letter queue backup."
+    },
+    {
+      "id": "err-401",
+      "label": "401 Unauthorized",
+      "sub": "Signature Rejection",
+      "type": "error",
+      "codeRef": "src/middleware/verify-signature.ts:31",
+      "ste100": {
+        "low": "The server rejects the request.",
+        "med": "The gateway stops the request and returns HTTP 401.",
+        "high": "The middleware stops the request before the parser reads the body. It returns HTTP 401 and writes the source IP address to the security log."
+      },
+      "validations": [
+        "No body parsing after a signature mismatch"
+      ],
+      "payload": {
+        "status": 401,
+        "error": "INVALID_SIGNATURE"
+      },
+      "edgeCases": "Salesforce does not retry a 4xx response, so an operator must fix the shared secret."
+    },
+    {
+      "id": "err-422",
+      "label": "422 Validation Error",
+      "sub": "Field Error Response",
+      "type": "error",
+      "codeRef": "src/schemas/lead-schema.ts:40",
+      "ste100": {
+        "low": "The server returns field errors.",
+        "med": "The validator returns HTTP 422 with a list of field errors.",
+        "high": "The validator collects all failed fields into one array. The gateway returns HTTP 422 with this array, and the worker does not get the job."
+      },
+      "validations": [],
+      "payload": {
+        "status": 422,
+        "errors": [
+          {
+            "path": "company",
+            "message": "Required"
+          }
+        ]
+      },
+      "edgeCases": "The response lists every failed field, so the sender can fix all errors in one change."
+    },
+    {
+      "id": "err-504",
+      "label": "504 Timeout & DLQ",
+      "sub": "Dead-Letter Queue Backup",
+      "type": "error",
+      "codeRef": "src/queues/dead-letter.ts:14",
+      "ste100": {
+        "low": "The system saves the failed job for later.",
+        "med": "The repository puts the failed job into the dead-letter queue.",
+        "high": "The repository stops the transaction after 5 seconds. It puts the job into the dead-letter queue, and the gateway returns HTTP 504."
+      },
+      "validations": [
+        "Retry count below 5"
+      ],
+      "payload": {
+        "status": 504,
+        "dlqMessageId": "dlq_51f0"
+      },
+      "edgeCases": "A scheduled worker reads the dead-letter queue every 10 minutes and tries the job again."
+    }
+  ],
+  "connections": [
+    {
+      "from": "node-sf",
+      "to": "node-auth",
+      "label": "POST /webhooks/lead"
+    },
+    {
+      "from": "node-auth",
+      "to": "node-validator",
+      "label": "Verified body"
+    },
+    {
+      "from": "node-validator",
+      "to": "node-worker",
+      "label": "Typed lead"
+    },
+    {
+      "from": "node-worker",
+      "to": "node-db",
+      "label": "Upsert"
+    },
+    {
+      "from": "node-auth",
+      "to": "err-401",
+      "label": "Bad signature"
+    },
+    {
+      "from": "node-validator",
+      "to": "err-422",
+      "label": "Schema errors"
+    },
+    {
+      "from": "node-db",
+      "to": "err-504",
+      "label": "Pool timeout"
+    }
+  ]
+}

@@ -1,922 +1,393 @@
 #!/usr/bin/env node
 /**
  * render-schematic.mjs
- * Generates an interactive, standalone "Software Machine" HTML/SVG schematic
- * from a structured system flow definition.
- * 
- * Features:
- * - 100% zero-dependency, self-contained single file output.
- * - Hardware / test-bench aesthetic inspired by Anatomy.
- * - Dynamic SVG cable routing with traveling signal pulse animations.
- * - 4 High-Craft Themes: Industrial Blueprint, Paper Ledger, Stealth Dark, Lab Sepia.
- * - Interactive Scenario Injector (200 OK, 401 Auth, 422 Validation, 504 Timeout).
- * - Real-time STE-100 Tier Switcher (Low, Medium, High).
- * - Live Oscilloscope / Payload Inspector sidebar.
+ * Renders a flow model (see references/flow-schema.md) into two artifacts:
+ * - a standalone SVG overview of the whole connected system, and
+ * - an interactive HTML page that embeds the same SVG plus a per-stage inspector.
+ * Both are fully pre-rendered, work offline, and have no runtime dependencies.
  */
 
 import { readFileSync, writeFileSync } from 'node:fs';
 
-export function renderSchematicHtml(flowData) {
-  const serializedData = JSON.stringify(flowData).replace(/</g, '\\u003c');
+export const TIERS = {
+  low: { button: 'Low (Quick)', heading: 'Low tier · executive summary' },
+  med: { button: 'Medium (Steps)', heading: 'Medium tier · step-by-step sequence' },
+  high: { button: 'High (Deep)', heading: 'High tier · deep technical specification' }
+};
+const TIER_ALIASES = { low: 'low', quick: 'low', med: 'med', medium: 'med', steps: 'med', high: 'high', deep: 'high' };
+export const NODE_TYPES = ['ingress', 'interlock', 'processor', 'egress', 'error'];
+
+export function resolveTier(value) {
+  const tier = TIER_ALIASES[String(value || 'high').toLowerCase()];
+  if (!tier) throw new Error(`Unknown tier "${value}". Use low, med, or high.`);
+  return tier;
+}
+
+/** Returns a list of human-readable problems; an empty list means the flow is valid. */
+export function validateFlow(flow, tier) {
+  const errors = [];
+  const check = (ok, msg) => ok || errors.push(msg);
+  if (!flow || typeof flow !== 'object') return ['Flow must be a JSON object.'];
+  check(typeof flow.title === 'string' && flow.title.trim(), '"title" must be a non-empty string.');
+  check(Array.isArray(flow.nodes) && flow.nodes.length, '"nodes" must be a non-empty array.');
+  const ids = new Set();
+  (flow.nodes || []).forEach((n, i) => {
+    const at = `nodes[${i}]`;
+    check(typeof n.id === 'string' && n.id, `${at}.id must be a non-empty string.`);
+    check(!ids.has(n.id), `${at}.id "${n.id}" is a duplicate.`);
+    ids.add(n.id);
+    check(typeof n.label === 'string' && n.label, `${at}.label must be a non-empty string.`);
+    check(NODE_TYPES.includes(n.type), `${at}.type must be one of: ${NODE_TYPES.join(', ')}.`);
+    if (tier) check(n.ste100?.[tier], `${at}.ste100.${tier} is missing (the requested tier).`);
+    else check(Object.keys(TIERS).some(t => n.ste100?.[t]), `${at}.ste100 needs at least one of low, med, high.`);
+    check(n.validations === undefined || Array.isArray(n.validations), `${at}.validations must be an array.`);
+  });
+  check(flow.connections === undefined || Array.isArray(flow.connections), '"connections" must be an array.');
+  (flow.connections || []).forEach((c, i) =>
+    check(ids.has(c.from) && ids.has(c.to), `connections[${i}] references an unknown node (${c.from} → ${c.to}).`));
+  (flow.scenarios || []).forEach((s, i) => {
+    check(s.id && s.name, `scenarios[${i}] needs "id" and "name".`);
+    (s.path || []).forEach(id => check(ids.has(id), `scenarios[${i}].path references unknown node "${id}".`));
+  });
+  return errors;
+}
+
+function assertFlow(flow, tier) {
+  const errors = validateFlow(flow, tier);
+  if (errors.length) throw new Error(`Invalid flow model:\n  - ${errors.join('\n  - ')}`);
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const clip = (s, n) => (s = String(s ?? '')).length > n ? s.slice(0, n - 1) + '…' : s;
+
+/** Word-wraps text to `max` chars per line; the last allowed line absorbs and clips the rest. */
+function wrap(text, max, maxLines) {
+  const lines = [];
+  for (const word of String(text ?? '').split(/\s+/).filter(Boolean)) {
+    const last = lines.length - 1;
+    if (last >= 0 && (lines[last] + ' ' + word).length <= max) lines[last] += ' ' + word;
+    else lines.push(word);
+  }
+  if (lines.length > maxLines) lines.splice(maxLines - 1, Infinity, lines.slice(maxLines - 1).join(' '));
+  return lines.map(l => clip(l, max));
+}
+
+const textLines = (lines, x, y, lineHeight, cls, anchor = 'start') =>
+  `<text class="${cls}" x="${x}" y="${y}" text-anchor="${anchor}">${lines
+    .map((l, i) => `<tspan x="${x}" dy="${i ? lineHeight : 0}">${esc(l)}</tspan>`).join('')}</text>`;
+
+// ---------------------------------------------------------------------------
+// Layout: main nodes flow left→right and wrap into rows; each error node sits
+// in a lane directly below the node that rejects into it.
+// ---------------------------------------------------------------------------
+export const GEOMETRY = { W: 190, H: 104, GAP: 130, PAD: 48, LANE: 96, ROW_GAP: 96 };
+
+export function layoutFlow(flow, { top = 64 } = {}) {
+  const { W, H, GAP, PAD, LANE, ROW_GAP } = GEOMETRY;
+  const conns = flow.connections || [];
+  const main = flow.nodes.filter(n => n.type !== 'error');
+  const rows = Math.ceil(main.length / 5) || 1;
+  const cols = Math.max(1, Math.ceil(main.length / rows));
+  const pos = {};
+  main.forEach((n, k) => (pos[n.id] = { row: Math.floor(k / cols), col: k % cols, lane: false }));
+
+  const taken = new Set();
+  flow.nodes.filter(n => n.type === 'error').forEach(n => {
+    const src = pos[conns.find(c => c.to === n.id && pos[c.from] && !pos[c.from].lane)?.from] || { row: rows - 1, col: 0 };
+    let col = src.col;
+    while (taken.has(`${src.row}:${col}`)) col++;
+    taken.add(`${src.row}:${col}`);
+    pos[n.id] = { row: src.row, col, lane: true };
+  });
+
+  const usedCols = Math.max(cols, ...Object.values(pos).map(p => p.col + 1));
+  const rowY = [];
+  let y = top;
+  for (let r = 0; r < rows; r++) {
+    const hasLane = Object.values(pos).some(p => p.lane && p.row === r);
+    rowY.push({ main: y, lane: y + H + LANE });
+    y += H + (hasLane ? LANE + H : 0) + ROW_GAP;
+  }
+  for (const p of Object.values(pos)) {
+    p.x = PAD + p.col * (W + GAP);
+    p.y = p.lane ? rowY[p.row].lane : rowY[p.row].main;
+  }
+  return { pos, width: PAD * 2 + usedCols * W + (usedCols - 1) * GAP, height: y - ROW_GAP + 64 };
+}
+
+/** SVG path + label anchor for one connection. */
+function routeCable(a, b) {
+  const { W, H, PAD, ROW_GAP } = GEOMETRY;
+  if (!a.lane && !b.lane && a.row === b.row && b.col === a.col + 1) {
+    const y = a.y + H / 2, x1 = a.x + W, x2 = b.x;
+    return { d: `M${x1} ${y}H${x2 - 4}`, lx: (x1 + x2) / 2, ly: y - 10, stack: 'up' };
+  }
+  if (!a.lane && !b.lane && b.row === a.row + 1 && b.col === 0) {
+    // Row wrap: leave right, run back along the gap above the next row, enter from the left.
+    const xr = a.x + W + PAD / 2, xl = b.x - PAD / 2, ym = b.y - ROW_GAP / 2, y1 = a.y + H / 2, y2 = b.y + H / 2;
+    return { d: `M${a.x + W} ${y1}H${xr}V${ym}H${xl}V${y2}H${b.x - 4}`, lx: (xr + xl) / 2, ly: ym - 8, stack: 'up' };
+  }
+  if (a.y === b.y) {
+    // Skip or back edge on the same row: arc over the top.
+    const x1 = a.x + W / 2, x2 = b.x + W / 2, peak = a.y - 44;
+    return { d: `M${x1} ${a.y}C${x1} ${peak} ${x2} ${peak} ${x2} ${a.y - 4}`, lx: (x1 + x2) / 2, ly: a.y - 39, stack: 'up' };
+  }
+  const down = b.y > a.y;
+  const x1 = a.x + W / 2, y1 = down ? a.y + H : a.y, x2 = b.x + W / 2, y2 = down ? b.y - 4 : b.y + H + 4, ym = (y1 + y2) / 2;
+  return { d: `M${x1} ${y1}C${x1} ${ym} ${x2} ${ym} ${x2} ${y2}`, lx: (x1 + x2) / 2 + 10, ly: ym + 4, anchor: 'start', stack: 'down' };
+}
+
+const SVG_CSS = `
+.diagram{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.diagram .bg{fill:var(--surface,#fff)}
+.ttl{font-size:20px;font-weight:700;fill:var(--text-1,#09090b)}
+.cpt{font-size:12px;fill:var(--text-3,#71717a)}
+.card{fill:var(--surface,#fff);stroke:var(--border,#e4e4e7);stroke-width:1.5}
+.head{fill:var(--surface-2,#f4f4f5)}
+.tag,.code,.lbl,.leg{font-family:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace}
+.tag{font-size:9px;font-weight:600;letter-spacing:.06em;fill:var(--text-3,#71717a)}
+.name{font-size:13px;font-weight:600;fill:var(--text-1,#09090b)}
+.sub{font-size:11px;fill:var(--text-3,#71717a)}
+.code{font-size:9.5px;fill:var(--text-4,#a1a1aa)}
+.wire path{fill:none;stroke:var(--wire,#a1a1aa);stroke-width:1.75;stroke-linecap:round;stroke-linejoin:round}
+.wire.err path{stroke:var(--err,#dc2626);stroke-dasharray:6 5}
+.ah{fill:var(--wire,#a1a1aa)} .ah.err{fill:var(--err,#dc2626)}
+.lbl,.leg{font-size:10px;fill:var(--text-3,#52525b)}
+.lbl{paint-order:stroke;stroke:var(--surface,#fff);stroke-width:5px;stroke-linejoin:round}
+.t-error .card{stroke:var(--err,#dc2626)} .t-error .head{fill:var(--err-soft,#fef2f2)} .t-error .tag{fill:var(--err,#dc2626)}`;
+
+/** The full connected-system diagram. `standalone` adds a title band and background for use as an image. */
+export function renderDiagramSvg(flow, { standalone = true } = {}) {
+  assertFlow(flow);
+  const { W, H } = GEOMETRY;
+  const { pos, width, height } = layoutFlow(flow, { top: standalone ? 120 : 64 });
+  const byId = Object.fromEntries(flow.nodes.map(n => [n.id, n]));
+
+  const wires = (flow.connections || []).filter(c => pos[c.from] && pos[c.to]).map(c => {
+    const r = routeCable(pos[c.from], pos[c.to]);
+    const err = byId[c.to].type === 'error';
+    const lines = c.label ? wrap(c.label, 18, 2) : [];
+    const ly = r.stack === 'up' ? r.ly - (lines.length - 1) * 12 : r.ly - ((lines.length - 1) * 12) / 2;
+    return `<g class="wire${err ? ' err' : ''}" data-edge="${esc(c.from)}--${esc(c.to)}"><path d="${r.d}" marker-end="url(#ah${err ? '-err' : ''})"/>` +
+      (lines.length ? textLines(lines, r.lx, ly, 12, 'lbl', r.anchor || 'middle') : '') + '</g>';
+  }).join('');
+
+  const cards = flow.nodes.map((n, i) => {
+    const p = pos[n.id];
+    const name = wrap(n.label, 24, 2);
+    const subY = 46 + name.length * 17;
+    return `<g class="node t-${n.type}" data-id="${esc(n.id)}" transform="translate(${p.x} ${p.y})" tabindex="0" role="button" aria-label="${esc(n.label)}">` +
+      `<title>${esc([n.label, n.sub, n.codeRef].filter(Boolean).join('\n'))}</title>` +
+      `<rect class="card" width="${W}" height="${H}" rx="10"/>` +
+      `<path class="head" d="M0 26V10A10 10 0 0 1 10 0H${W - 10}A10 10 0 0 1 ${W} 10V26Z"/>` +
+      `<text class="tag" x="12" y="17">${String(i + 1).padStart(2, '0')} · ${esc(n.type.toUpperCase())}</text>` +
+      textLines(name, 12, 46, 17, 'name') +
+      `<text class="sub" x="12" y="${subY}">${esc(clip(n.sub, 30))}</text>` +
+      (n.codeRef ? `<text class="code" x="12" y="${H - 11}">${esc(clip(n.codeRef.split('/').pop(), 30))}</text>` : '') + '</g>';
+  }).join('');
+
+  const hasErrors = flow.nodes.some(n => n.type === 'error');
+  const ly = height - 26;
+  const legend = `<g transform="translate(${GEOMETRY.PAD} ${ly})"><path d="M0 0H28" stroke="var(--wire,#a1a1aa)" stroke-width="1.75"/>` +
+    `<text class="leg" x="36" y="3.5">Main path</text>` + (hasErrors
+      ? `<path d="M120 0H148" stroke="var(--err,#dc2626)" stroke-width="1.75" stroke-dasharray="6 5"/><text class="leg" x="156" y="3.5">Error / rejection path</text>` : '') + '</g>';
+
+  const marker = (id, cls) => `<marker id="${id}" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="${cls}" d="M0 1L9 5L0 9z"/></marker>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" class="diagram" viewBox="0 0 ${width} ${height}" width="${width}" height="${height}" role="img" aria-label="${esc(flow.title)}">` +
+    `<style>${SVG_CSS}</style><defs>${marker('ah', 'ah')}${marker('ah-err', 'ah err')}</defs>` +
+    (standalone ? `<rect class="bg" width="100%" height="100%"/>${textLines([flow.title], GEOMETRY.PAD, 52, 0, 'ttl')}` +
+      (flow.concept ? textLines(wrap(flow.concept, 110, 2), GEOMETRY.PAD, 76, 16, 'cpt') : '') : '') +
+    `<g>${wires}</g><g>${cards}</g>${legend}${standalone ? '' : '<circle class="pulse" r="5"/>'}</svg>`;
+}
+
+// ---------------------------------------------------------------------------
+// Interactive HTML page
+// ---------------------------------------------------------------------------
+const PAGE_CSS = `
+:root{--bg:#fafafa;--surface:#fff;--surface-2:#f4f4f5;--border:#e4e4e7;--border-strong:#a1a1aa;--text-1:#09090b;--text-2:#3f3f46;--text-3:#71717a;--text-4:#a1a1aa;--wire:#a1a1aa;--err:#dc2626;--err-soft:#fef2f2;--pill:#09090b;--pill-text:#fff;
+  --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0b0d;--surface:#141417;--surface-2:#1c1c20;--border:#2a2a30;--border-strong:#52525b;--text-1:#f4f4f5;--text-2:#d4d4d8;--text-3:#a1a1aa;--text-4:#71717a;--wire:#52525b;--err:#f87171;--err-soft:#2a1416;--pill:#f4f4f5;--pill-text:#09090b;color-scheme:dark}}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text-1);font-family:var(--sans);min-height:100vh;display:flex;flex-direction:column;-webkit-font-smoothing:antialiased}
+.bar{background:var(--surface);border-bottom:1px solid var(--border);padding:12px clamp(16px,3vw,32px);display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:12px}
+header.bar{position:sticky;top:0;z-index:5}
+.brand{display:flex;align-items:center;gap:12px;min-width:0} h1{font-size:15px;font-weight:600}
+.badge,.pill,kbd,.ref,.count{font-family:var(--mono);font-size:11px;border:1px solid var(--border);background:var(--surface-2);border-radius:6px;padding:3px 8px;color:var(--text-2)}
+.pill{background:var(--pill);color:var(--pill-text);border-color:var(--pill);font-weight:600}
+.chips,.controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.caption,h3{font-family:var(--mono);font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--text-4)}
+button{font:500 12px var(--sans);background:var(--surface);color:var(--text-2);border:1px solid var(--border);border-radius:999px;padding:5px 12px;cursor:pointer;transition:color .16s,border-color .16s,transform .1s}
+button:hover{color:var(--text-1);border-color:var(--border-strong)} button:active{transform:scale(.97)}
+button[aria-pressed=true],button.primary{background:var(--pill);color:var(--pill-text);border-color:var(--pill)}
+.controls button{border-radius:6px}
+main{flex:1;width:100%;max-width:1480px;margin:0 auto;padding:clamp(16px,3vw,32px);display:flex;flex-direction:column;gap:24px}
+.card-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;overflow:hidden}
+.card-head{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:8px;justify-content:space-between;align-items:center;font-size:13px;font-weight:600}
+.hint{font:11px var(--mono);color:var(--text-4);display:flex;gap:6px;align-items:center}
+.viewport{overflow-x:auto;padding:8px}
+.viewport svg{display:block;margin:0 auto;height:auto;width:100%;min-width:var(--min-w)}
+.node{cursor:pointer;outline:none} .node,.wire{transition:opacity .2s}
+.node:hover .card{stroke:var(--border-strong)} .node:focus-visible .card{stroke:var(--text-2);stroke-dasharray:4 3}
+.node.active .card{stroke:var(--text-1);stroke-width:2.4} .t-error.active .card{stroke:var(--err)}
+.node.dim,.wire.dim{opacity:.25} .wire.on path{stroke:var(--text-1);stroke-width:2.6} .wire.err.on path{stroke:var(--err)}
+.pulse{fill:var(--text-1);opacity:0;pointer-events:none}
+.stage{display:grid;grid-template-columns:minmax(0,1.3fr) minmax(0,.7fr);gap:24px} .stage[hidden]{display:none}
+@media (max-width:900px){.stage{grid-template-columns:1fr}}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:24px;display:flex;flex-direction:column;gap:16px}
+.panel h2{font-size:22px;letter-spacing:-.02em} .muted{color:var(--text-3);font-size:14px;line-height:1.5} .ref{align-self:flex-start;word-break:break-all}
+.story{background:var(--surface-2);border:1px solid var(--border);border-radius:10px;padding:18px;display:flex;flex-direction:column;gap:8px} .story p{font-size:15px;line-height:1.6}
+.tier{border:1px solid var(--border);border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:6px} .tier p{font-size:14px;line-height:1.55;color:var(--text-2)}
+ul{list-style:none;display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--text-2)} li::before{content:"✓ ";font-weight:700;color:var(--text-1)} li.none::before{content:"— "}
+.t-error-panel h2{color:var(--err)}
+pre{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:16px;font:12px/1.5 var(--mono);color:var(--text-2);overflow-x:auto}
+footer.bar{font:11px var(--mono);color:var(--text-3);border-top:1px solid var(--border);border-bottom:0}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}`;
+
+function stagePanel(n, i, total, tier) {
+  const checks = n.validations?.length ? n.validations.map(v => `<li>${esc(v)}</li>`).join('') : '<li class="none">No guard checks on this stage.</li>';
+  return `<article class="stage" data-id="${esc(n.id)}"${i ? ' hidden' : ''}>
+  <section class="panel${n.type === 'error' ? ' t-error-panel' : ''}">
+    <h3>Stage ${i + 1} of ${total} · ${esc(n.type)}</h3>
+    <div><h2>${esc(n.label)}</h2>${n.sub ? `<p class="muted">${esc(n.sub)}</p>` : ''}</div>
+    <span class="ref">${n.codeRef ? `Source: ${esc(n.codeRef)}` : 'Framework boundary'}</span>
+    ${n.story ? `<div class="story"><h3>How it works in plain English</h3><p>${esc(n.story)}</p></div>` : ''}
+    <div class="tier"><h3>${TIERS[tier].heading}</h3><p>${esc(n.ste100[tier])}</p></div>
+    <h3>Rules enforced at this stage</h3><ul>${checks}</ul>
+    <h3>What happens if something fails?</h3><p class="muted">${esc(n.edgeCases || 'Standard operating path.')}</p>
+  </section>
+  <section class="panel"><h3>Data contract in transit</h3><pre>${esc(JSON.stringify(n.payload ?? {}, null, 2))}</pre></section>
+</article>`;
+}
+
+// Client script: all content is pre-rendered, so it only toggles classes and `hidden`.
+const CLIENT_JS = `
+const $ = s => [...document.querySelectorAll(s)];
+const vp = document.querySelector('.viewport'), dot = document.querySelector('.pulse');
+const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+let path = SCENARIOS[0].path, step = 0, timer = null;
+const edges = upto => new Set(path.slice(0, upto).map((id, k) => id + '--' + path[k + 1]));
+
+function show(i) {
+  step = (i + path.length) % path.length;
+  const id = path[step], lit = edges(step), onPath = edges(path.length - 1);
+  $('.node').forEach(g => { g.classList.toggle('active', g.dataset.id === id); g.classList.toggle('dim', !path.includes(g.dataset.id)); });
+  $('.wire').forEach(w => { w.classList.toggle('on', lit.has(w.dataset.edge)); w.classList.toggle('dim', !onPath.has(w.dataset.edge)); });
+  $('.stage').forEach(s => (s.hidden = s.dataset.id !== id));
+  document.getElementById('stepBadge').textContent = 'Step ' + (step + 1) + ' of ' + path.length;
+  const g = $('.node').find(n => n.dataset.id === id), r = g.getBoundingClientRect(), v = vp.getBoundingClientRect();
+  vp.scrollBy({ left: r.left + r.width / 2 - (v.left + v.width / 2), behavior: still ? 'auto' : 'smooth' });
+  if (step) pulse(path[step - 1] + '--' + id);
+}
+
+function pulse(edge) {
+  const p = $('.wire').find(w => w.dataset.edge === edge)?.querySelector('path');
+  if (!p || still) return;
+  const len = p.getTotalLength(), t0 = performance.now();
+  dot.style.opacity = 1;
+  requestAnimationFrame(function frame(t) {
+    const k = Math.min((t - t0) / 450, 1), pt = p.getPointAtLength(k * len);
+    dot.setAttribute('cx', pt.x); dot.setAttribute('cy', pt.y);
+    k < 1 ? requestAnimationFrame(frame) : (dot.style.opacity = 0);
+  });
+}
+
+function useScenario(sc, at = 0) {
+  path = sc.path;
+  $('[data-scenario]').forEach(b => b.setAttribute('aria-pressed', b.dataset.scenario === sc.id));
+  show(at);
+}
+
+function stopAuto() { clearInterval(timer); timer = null; document.getElementById('btnAuto').textContent = 'Auto-play'; }
+
+$('[data-scenario]').forEach(b => b.addEventListener('click', () => { stopAuto(); useScenario(SCENARIOS.find(s => s.id === b.dataset.scenario)); }));
+$('.node').forEach(g => {
+  const pick = () => {
+    const id = g.dataset.id;
+    if (path.includes(id)) return show(path.indexOf(id));
+    const sc = SCENARIOS.find(s => s.path.includes(id)) || { id: null, path: [id] };
+    useScenario(sc, sc.path.indexOf(id));
+  };
+  g.addEventListener('click', pick);
+  g.addEventListener('keydown', e => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), pick()));
+});
+document.getElementById('btnPrev').onclick = () => show(step - 1);
+document.getElementById('btnNext').onclick = () => show(step + 1);
+document.getElementById('btnReset').onclick = () => { stopAuto(); show(0); };
+document.getElementById('btnAuto').onclick = e => timer ? stopAuto() : (e.target.textContent = 'Pause', timer = setInterval(() => show(step + 1), 2200));
+addEventListener('keydown', e => {
+  if (e.target.closest('button, .node')) return;
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); show(step + 1); }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); show(step - 1); }
+});
+useScenario(SCENARIOS[0]);`;
+
+export function renderSchematicHtml(flow, options = {}) {
+  const tier = resolveTier(options.tier || flow.tier);
+  assertFlow(flow, tier);
+  const mainPath = flow.nodes.filter(n => n.type !== 'error').map(n => n.id);
+  const declared = (flow.scenarios || []).map(s => ({ id: s.id, name: s.name, description: s.description, path: s.path?.length ? s.path : mainPath }));
+  const scenarios = declared.length ? declared : [{ id: 'main', name: 'Main path', path: mainPath }];
+  const svg = renderDiagramSvg(flow, { standalone: false });
+  const minWidth = Math.round(layoutFlow(flow).width * 0.72);
 
   return `<!DOCTYPE html>
-<html lang="en" data-theme="${flowData.theme || 'blueprint'}">
+<html lang="en">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>${escapeHtml(flowData.title)} · Software Machine Schematic</title>
-  <style>
-    :root {
-      --font-mono: "JetBrains Mono", "Space Mono", "Fira Code", monospace;
-      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      --transition-speed: 0.2s;
-    }
-
-    /* THEME: BLUEPRINT (Default) */
-    html[data-theme="blueprint"] {
-      --bg: #07131e;
-      --grid-line: rgba(0, 240, 255, 0.07);
-      --panel-bg: #0d2235;
-      --panel-border: #183e5c;
-      --panel-header: #122d45;
-      --text-main: #d8ecf8;
-      --text-muted: #6e9cb8;
-      --accent: #00f0ff;
-      --accent-glow: rgba(0, 240, 255, 0.35);
-      --wire-base: #1b415e;
-      --wire-active: #00f0ff;
-      --success: #00e5a3;
-      --error: #ff3b5c;
-      --warning: #ffb800;
-      --led-off: #0b1a26;
-      --code-bg: #05101a;
-    }
-
-    /* THEME: PAPER LEDGER */
-    html[data-theme="paper"] {
-      --bg: #f5f2e9;
-      --grid-line: rgba(70, 60, 50, 0.08);
-      --panel-bg: #ffffff;
-      --panel-border: #d4ccbd;
-      --panel-header: #ece6d8;
-      --text-main: #23201d;
-      --text-muted: #7c7267;
-      --accent: #d9531e;
-      --accent-glow: rgba(217, 83, 30, 0.25);
-      --wire-base: #cfc6b5;
-      --wire-active: #d9531e;
-      --success: #1e7e58;
-      --error: #b82424;
-      --warning: #c98a0c;
-      --led-off: #ded7c8;
-      --code-bg: #ece7db;
-    }
-
-    /* THEME: STEALTH DARK */
-    html[data-theme="dark"] {
-      --bg: #0d0f12;
-      --grid-line: rgba(255, 255, 255, 0.04);
-      --panel-bg: #16191f;
-      --panel-border: #262c37;
-      --panel-header: #1e222b;
-      --text-main: #f0f3f6;
-      --text-muted: #7d8590;
-      --accent: #6366f1;
-      --accent-glow: rgba(99, 102, 241, 0.35);
-      --wire-base: #2a313d;
-      --wire-active: #818cf8;
-      --success: #10b981;
-      --error: #f43f5e;
-      --warning: #f59e0b;
-      --led-off: #1c212a;
-      --code-bg: #090a0d;
-    }
-
-    /* THEME: LAB SEPIA */
-    html[data-theme="sepia"] {
-      --bg: #1a1510;
-      --grid-line: rgba(229, 169, 60, 0.08);
-      --panel-bg: #27211a;
-      --panel-border: #44392e;
-      --panel-header: #332b22;
-      --text-main: #ebdcc9;
-      --text-muted: #96836f;
-      --accent: #e5a93c;
-      --accent-glow: rgba(229, 169, 60, 0.35);
-      --wire-base: #3f3428;
-      --wire-active: #e5a93c;
-      --success: #5eb074;
-      --error: #cf4f38;
-      --warning: #d99a26;
-      --led-off: #201a14;
-      --code-bg: #14100c;
-    }
-
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      background-color: var(--bg);
-      background-image: 
-        linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
-        linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
-      background-size: 24px 24px;
-      color: var(--text-main);
-      font-family: var(--font-sans);
-      height: 100vh;
-      overflow: hidden;
-      display: flex;
-      flex-direction: column;
-    }
-
-    /* HEADER BAR */
-    header.masthead {
-      height: 56px;
-      background: var(--panel-bg);
-      border-bottom: 1px solid var(--panel-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 20px;
-      z-index: 10;
-    }
-    .masthead-title {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-    .badge-machine {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      text-transform: uppercase;
-      background: var(--panel-header);
-      border: 1px solid var(--panel-border);
-      padding: 3px 8px;
-      border-radius: 3px;
-      color: var(--accent);
-      letter-spacing: 0.05em;
-    }
-    .title-text {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-    }
-
-    .masthead-controls {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .control-group {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      background: var(--panel-header);
-      padding: 3px;
-      border-radius: 4px;
-      border: 1px solid var(--panel-border);
-    }
-    .control-btn {
-      background: transparent;
-      border: none;
-      color: var(--text-muted);
-      font-family: var(--font-mono);
-      font-size: 11px;
-      padding: 4px 10px;
-      border-radius: 3px;
-      cursor: pointer;
-      transition: all var(--transition-speed);
-    }
-    .control-btn:hover { color: var(--text-main); }
-    .control-btn.active {
-      background: var(--accent);
-      color: #000;
-      font-weight: 700;
-      box-shadow: 0 0 10px var(--accent-glow);
-    }
-
-    /* MAIN WORKSPACE */
-    main.workspace {
-      flex: 1;
-      display: flex;
-      position: relative;
-      overflow: hidden;
-    }
-
-    /* SCHEMATIC STAGE */
-    .schematic-stage {
-      flex: 1;
-      position: relative;
-      overflow: auto;
-      display: flex;
-      flex-direction: column;
-    }
-
-    /* TOOLBAR / STATE INJECTOR */
-    .injector-bar {
-      padding: 12px 24px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 16px;
-      background: rgba(0,0,0,0.1);
-      border-bottom: 1px solid var(--grid-line);
-    }
-    .injector-scenarios {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .scenario-label {
-      font-size: 11px;
-      font-family: var(--font-mono);
-      color: var(--text-muted);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      margin-right: 4px;
-    }
-    .scenario-btn {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      background: var(--panel-bg);
-      border: 1px solid var(--panel-border);
-      color: var(--text-main);
-      padding: 5px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      transition: all var(--transition-speed);
-    }
-    .scenario-btn .led {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--led-off);
-      transition: all var(--transition-speed);
-    }
-    .scenario-btn.active {
-      border-color: var(--accent);
-      background: var(--panel-header);
-    }
-    .scenario-btn.active .led {
-      background: var(--accent);
-      box-shadow: 0 0 8px var(--accent);
-    }
-
-    .playback-controls {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .play-btn {
-      background: var(--panel-bg);
-      border: 1px solid var(--panel-border);
-      color: var(--text-main);
-      font-family: var(--font-mono);
-      font-size: 12px;
-      padding: 5px 12px;
-      border-radius: 4px;
-      cursor: pointer;
-      transition: all var(--transition-speed);
-    }
-    .play-btn:hover { border-color: var(--accent); }
-    .play-btn.primary {
-      background: var(--accent);
-      color: #000;
-      font-weight: 600;
-      border-color: var(--accent);
-    }
-
-    /* SVG CANVAS */
-    .canvas-container {
-      flex: 1;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 40px;
-      min-width: 900px;
-      position: relative;
-    }
-    svg.schematic-svg {
-      width: 100%;
-      max-width: 1100px;
-      height: auto;
-      filter: drop-shadow(0 12px 30px rgba(0,0,0,0.3));
-    }
-
-    /* SVG ELEMENTS */
-    .svg-node {
-      cursor: pointer;
-      transition: transform 0.15s ease, filter 0.15s ease;
-    }
-    .svg-node:hover {
-      filter: drop-shadow(0 0 12px var(--accent-glow));
-    }
-    .svg-node.active-node rect.plate-body {
-      stroke: var(--accent);
-      stroke-width: 2px;
-    }
-    .svg-node.active-node text.plate-title {
-      fill: var(--accent);
-    }
-
-    /* SVG WIRE STYLES */
-    .svg-wire {
-      stroke: var(--wire-base);
-      stroke-width: 2.5;
-      fill: none;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      transition: stroke 0.3s ease;
-    }
-    .svg-wire.active-wire {
-      stroke: var(--wire-active);
-      filter: drop-shadow(0 0 6px var(--accent-glow));
-    }
-    .svg-wire.success-wire {
-      stroke: var(--success);
-    }
-    .svg-wire.error-wire {
-      stroke: var(--error);
-    }
-    .signal-pulse {
-      fill: var(--accent);
-      filter: drop-shadow(0 0 8px var(--accent));
-      opacity: 0;
-    }
-    .signal-pulse.traveling {
-      opacity: 1;
-    }
-
-    /* INSPECTOR SIDEBAR */
-    aside.inspector {
-      width: 420px;
-      background: var(--panel-bg);
-      border-left: 1px solid var(--panel-border);
-      display: flex;
-      flex-direction: column;
-      z-index: 10;
-    }
-    .inspector-header {
-      padding: 16px 20px;
-      background: var(--panel-header);
-      border-bottom: 1px solid var(--panel-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-    }
-    .inspector-title {
-      font-size: 13px;
-      font-family: var(--font-mono);
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--accent);
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .inspector-body {
-      flex: 1;
-      padding: 20px;
-      overflow-y: auto;
-      display: flex;
-      flex-direction: column;
-      gap: 20px;
-    }
-
-    .field-card {
-      background: rgba(0,0,0,0.15);
-      border: 1px solid var(--panel-border);
-      border-radius: 6px;
-      padding: 14px;
-    }
-    .field-label {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-muted);
-      margin-bottom: 6px;
-    }
-    .field-value {
-      font-size: 13px;
-      line-height: 1.5;
-      color: var(--text-main);
-    }
-    .field-value.code-ref {
-      font-family: var(--font-mono);
-      color: var(--accent);
-      font-size: 11px;
-    }
-
-    .ste100-badge {
-      display: inline-block;
-      font-family: var(--font-mono);
-      font-size: 9px;
-      background: rgba(0, 240, 255, 0.1);
-      border: 1px solid var(--accent);
-      color: var(--accent);
-      padding: 2px 6px;
-      border-radius: 3px;
-      margin-bottom: 8px;
-    }
-
-    pre.code-payload {
-      background: var(--code-bg);
-      border: 1px solid var(--panel-border);
-      border-radius: 4px;
-      padding: 12px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--text-main);
-      overflow-x: auto;
-      line-height: 1.4;
-    }
-
-    .validation-list {
-      list-style: none;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    .validation-item {
-      font-size: 12px;
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-    }
-    .check-icon {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--success);
-      font-weight: bold;
-    }
-    .warn-icon {
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--error);
-      font-weight: bold;
-    }
-
-    /* FOOTER STATUS */
-    footer.status-bar {
-      height: 32px;
-      background: var(--panel-header);
-      border-top: 1px solid var(--panel-border);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 0 16px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--text-muted);
-    }
-    .status-ticker {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .status-item span.lit {
-      color: var(--accent);
-      font-weight: bold;
-    }
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>${esc(flow.title)} · explain-it</title>
+<style>${PAGE_CSS}</style>
 </head>
 <body>
-
-  <!-- HEADER MASTHEAD -->
-  <header class="masthead">
-    <div class="masthead-title">
-      <span class="badge-machine">EXPLAIN-IT // ASD-STE100</span>
-      <h1 class="title-text">${escapeHtml(flowData.title)}</h1>
-    </div>
-    <div class="masthead-controls">
-      <!-- DETAIL LEVEL SWITCHER -->
-      <div class="control-group" title="ASD-STE100 Explanation Depth">
-        <button class="control-btn" data-tier="low">LOW</button>
-        <button class="control-btn" data-tier="med">MEDIUM</button>
-        <button class="control-btn active" data-tier="high">HIGH</button>
-      </div>
-      <!-- THEME SWITCHER -->
-      <div class="control-group" title="Machine Finish & Theme">
-        <button class="control-btn active" data-theme-btn="blueprint">BLUEPRINT</button>
-        <button class="control-btn" data-theme-btn="paper">PAPER</button>
-        <button class="control-btn" data-theme-btn="dark">STEALTH</button>
-        <button class="control-btn" data-theme-btn="sepia">SEPIA</button>
-      </div>
-    </div>
-  </header>
-
-  <!-- MAIN WORKSPACE -->
-  <main class="workspace">
-    <div class="schematic-stage">
-      <!-- STATE INJECTOR & PLAYBACK TOOLBAR -->
-      <div class="injector-bar">
-        <div class="injector-scenarios">
-          <span class="scenario-label">Inject Scenario:</span>
-          ${(flowData.scenarios || []).map((sc, i) => `
-            <button class="scenario-btn ${i === 0 ? 'active' : ''}" data-scenario="${sc.id}">
-              <span class="led"></span>
-              <span>${escapeHtml(sc.name)}</span>
-            </button>
-          `).join('')}
-        </div>
-        <div class="playback-controls">
-          <button class="play-btn" id="btnPrev" title="Previous Hop (Space / ArrowLeft)">◀ Prev</button>
-          <button class="play-btn primary" id="btnNext" title="Next Hop (Space / ArrowRight)">Next Step ▶</button>
-          <button class="play-btn" id="btnAutoPlay">Auto-Trace</button>
-          <button class="play-btn" id="btnReset">↺ Reset</button>
-        </div>
-      </div>
-
-      <!-- SVG SCHEMATIC STAGE -->
-      <div class="canvas-container">
-        <svg class="schematic-svg" viewBox="0 0 1000 520" xmlns="http://www.w3.org/2000/svg">
-          <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
-              <path d="M 0 1.5 L 8 5 L 0 8.5 z" fill="var(--wire-base)" class="arrow-head"/>
-            </marker>
-            <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
-              <feGaussianBlur stdDeviation="3" result="blur" />
-              <feComposite in="SourceGraphic" in2="blur" operator="over" />
-            </filter>
-          </defs>
-
-          <!-- SVG WIRES GROUP -->
-          <g id="wiresGroup"></g>
-
-          <!-- SVG NODES GROUP -->
-          <g id="nodesGroup"></g>
-
-          <!-- SIGNAL PULSE PARTICLE -->
-          <circle id="signalPulse" class="signal-pulse" r="5" cx="0" cy="0" />
-        </svg>
-      </div>
-    </div>
-
-    <!-- OSCILLOSCOPE INSPECTOR SIDEBAR -->
-    <aside class="inspector">
-      <div class="inspector-header">
-        <div class="inspector-title">
-          <span>●</span> OSCILLOSCOPE // STAGE READOUT
-        </div>
-        <span class="badge-machine" id="inspectStageId">STAGE 1</span>
-      </div>
-      <div class="inspector-body">
-        <div class="field-card">
-          <div class="field-label">Target Module / Stage</div>
-          <div class="field-value" id="inspectNodeName" style="font-weight: 600; font-size: 15px;">-</div>
-          <div class="field-value code-ref" id="inspectCodeRef" style="margin-top: 4px;">-</div>
-        </div>
-
-        <div class="field-card">
-          <span class="ste100-badge">ASD-STE100 SPECIFICATION</span>
-          <div class="field-label" id="inspectTierLabel">EXPLANATION (HIGH TIER)</div>
-          <div class="field-value" id="inspectExplanation">-</div>
-        </div>
-
-        <div class="field-card" id="validationCard">
-          <div class="field-label">Enforced Rules & Validations</div>
-          <ul class="validation-list" id="inspectValidations">
-            <li class="validation-item"><span class="check-icon">✓</span> None</li>
-          </ul>
-        </div>
-
-        <div class="field-card">
-          <div class="field-label">Simulated Signal Payload</div>
-          <pre class="code-payload" id="inspectPayload">{}</pre>
-        </div>
-
-        <div class="field-card" id="edgeCaseCard">
-          <div class="field-label">Edge Cases & Failure Branches</div>
-          <div class="field-value" id="inspectEdgeCases" style="font-size: 12px; color: var(--text-muted);">-</div>
-        </div>
-      </div>
-    </aside>
-  </main>
-
-  <!-- FOOTER STATUS BAR -->
-  <footer class="status-bar">
-    <div class="status-ticker">
-      <div class="status-item">FLOW: <span class="lit">${escapeHtml(flowData.concept || 'System Trace')}</span></div>
-      <div class="status-item">HOPS: <span class="lit" id="tickerHops">${flowData.nodes?.length || 0} Nodes</span></div>
-      <div class="status-item">CURRENT STATE: <span class="lit" id="tickerState">READY</span></div>
-    </div>
-    <div>ASD-STE100 VERIFIED • NO AMBIGUOUS VOCABULARY</div>
-  </footer>
-
-  <!-- EMBEDDED ENGINE RUNTIME -->
-  <script>
-    const DATA = ${serializedData};
-    let currentTier = 'high';
-    let currentScenarioId = (DATA.scenarios && DATA.scenarios[0]) ? DATA.scenarios[0].id : 'default';
-    let currentStepIndex = 0;
-    let autoPlayInterval = null;
-
-    // Node Positions Layout
-    const nodeCoords = calculateLayout(DATA.nodes);
-
-    // Initialize DOM
-    document.addEventListener('DOMContentLoaded', () => {
-      buildSvgGraph();
-      setupEventListeners();
-      selectStep(0);
-    });
-
-    function calculateLayout(nodes) {
-      const coords = {};
-      const total = nodes.length;
-      const startX = 60;
-      const spacingX = total > 1 ? (860 - startX) / (total - 1) : 400;
-      const centerY = 230;
-
-      nodes.forEach((node, index) => {
-        coords[node.id] = {
-          x: Math.round(startX + index * spacingX),
-          y: node.type === 'error_sink' ? centerY + 130 : centerY,
-          width: 150,
-          height: 90
-        };
-      });
-      return coords;
-    }
-
-    function buildSvgGraph() {
-      const wiresGroup = document.getElementById('wiresGroup');
-      const nodesGroup = document.getElementById('nodesGroup');
-      wiresGroup.innerHTML = '';
-      nodesGroup.innerHTML = '';
-
-      // Render Wires
-      (DATA.connections || []).forEach((conn, index) => {
-        const from = nodeCoords[conn.from];
-        const to = nodeCoords[conn.to];
-        if (!from || !to) return;
-
-        const startX = from.x + from.width;
-        const startY = from.y + from.height / 2;
-        const endX = to.x;
-        const endY = to.y + to.height / 2;
-
-        const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-        const d = \`M \${startX} \${startY} C \${startX + 40} \${startY}, \${endX - 40} \${endY}, \${endX} \${endY}\`;
-        path.setAttribute('d', d);
-        path.setAttribute('class', 'svg-wire');
-        path.setAttribute('id', \`wire-\${conn.from}-\${conn.to}\`);
-        wiresGroup.appendChild(path);
-      });
-
-      // Render Nodes
-      DATA.nodes.forEach((node, index) => {
-        const pos = nodeCoords[node.id];
-        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
-        g.setAttribute('class', 'svg-node');
-        g.setAttribute('id', \`node-\${node.id}\`);
-        g.setAttribute('transform', \`translate(\${pos.x}, \${pos.y})\`);
-
-        const isInterlock = node.type === 'interlock';
-        const isError = node.type === 'error_sink';
-
-        g.innerHTML = \`
-          <!-- Base Enclosure -->
-          <rect class="plate-body" width="\${pos.width}" height="\${pos.height}" rx="6" 
-                fill="var(--panel-bg)" stroke="var(--panel-border)" stroke-width="1.5"/>
-          <!-- Header Bar -->
-          <rect width="\${pos.width}" height="24" rx="6" fill="var(--panel-header)"/>
-          <rect y="18" width="\${pos.width}" height="6" fill="var(--panel-header)"/>
-          <!-- Status LED -->
-          <circle cx="14" cy="12" r="3.5" fill="\${isError ? 'var(--error)' : 'var(--accent)'}"/>
-          <!-- Type Tag -->
-          <text x="24" y="15" font-family="var(--font-mono)" font-size="9" fill="var(--text-muted)" letter-spacing="0.05em">
-            \${(node.type || 'MODULE').toUpperCase()}
-          </text>
-          <!-- Title -->
-          <text class="plate-title" x="12" y="45" font-family="var(--font-sans)" font-size="12" font-weight="600" fill="var(--text-main)">
-            \${escapeHtml(node.label)}
-          </text>
-          <!-- Subtitle / Action -->
-          <text x="12" y="62" font-family="var(--font-mono)" font-size="9" fill="var(--text-muted)">
-            \${escapeHtml(truncate(node.sub || '', 20))}
-          </text>
-          <!-- Code File Indicator -->
-          <text x="12" y="78" font-family="var(--font-mono)" font-size="8" fill="var(--accent)">
-            \${node.codeRef ? '● ' + escapeHtml(truncate(node.codeRef.split('/').pop(), 22)) : ''}
-          </text>
-        \`;
-
-        g.addEventListener('click', () => selectStep(index));
-        nodesGroup.appendChild(g);
-      });
-    }
-
-    function selectStep(index) {
-      if (index < 0 || index >= DATA.nodes.length) return;
-      currentStepIndex = index;
-      const node = DATA.nodes[index];
-
-      // Highlight active node
-      document.querySelectorAll('.svg-node').forEach(n => n.classList.remove('active-node'));
-      const activeEl = document.getElementById(\`node-\${node.id}\`);
-      if (activeEl) activeEl.classList.add('active-node');
-
-      // Update Inspector Sidebar
-      document.getElementById('inspectStageId').textContent = \`STAGE \${index + 1} OF \${DATA.nodes.length}\`;
-      document.getElementById('inspectNodeName').textContent = node.label;
-      document.getElementById('inspectCodeRef').textContent = node.codeRef || 'No direct source link';
-
-      // STE-100 Text
-      const steText = (node.ste100 && node.ste100[currentTier]) 
-        ? node.ste100[currentTier] 
-        : (node.description || 'No description available.');
-      document.getElementById('inspectExplanation').textContent = steText;
-      document.getElementById('inspectTierLabel').textContent = \`EXPLANATION (\${currentTier.toUpperCase()} TIER)\`;
-
-      // Validations
-      const valList = document.getElementById('inspectValidations');
-      valList.innerHTML = '';
-      if (node.validations && node.validations.length > 0) {
-        node.validations.forEach(v => {
-          const li = document.createElement('li');
-          li.className = 'validation-item';
-          li.innerHTML = \`<span class="check-icon">✓</span> <span>\${escapeHtml(v)}</span>\`;
-          valList.appendChild(li);
-        });
-      } else {
-        valList.innerHTML = '<li class="validation-item" style="color:var(--text-muted)">No active guards on this step.</li>';
-      }
-
-      // Payload
-      const payloadEl = document.getElementById('inspectPayload');
-      payloadEl.textContent = JSON.stringify(node.payload || { status: 'idle' }, null, 2);
-
-      // Edge Cases
-      document.getElementById('inspectEdgeCases').textContent = node.edgeCases || 'Standard operating path. No anomalous conditions defined.';
-
-      // Ticker
-      document.getElementById('tickerState').textContent = \`STEP \${index + 1}: \${node.label.toUpperCase()}\`;
-
-      // Animate Pulse along wire if there's a previous hop
-      if (index > 0) {
-        const prevNode = DATA.nodes[index - 1];
-        pulseWire(prevNode.id, node.id);
-      }
-    }
-
-    function pulseWire(fromId, toId) {
-      const wire = document.getElementById(\`wire-\${fromId}-\${toId}\`);
-      const pulse = document.getElementById('signalPulse');
-      if (!wire || !pulse) return;
-
-      wire.classList.add('active-wire');
-      pulse.classList.add('traveling');
-
-      const length = wire.getTotalLength();
-      let start = null;
-      const duration = 400;
-
-      function step(timestamp) {
-        if (!start) start = timestamp;
-        const progress = Math.min((timestamp - start) / duration, 1);
-        const point = wire.getPointAtLength(progress * length);
-        pulse.setAttribute('cx', point.x);
-        pulse.setAttribute('cy', point.y);
-
-        if (progress < 1) {
-          requestAnimationFrame(step);
-        } else {
-          pulse.classList.remove('traveling');
-        }
-      }
-      requestAnimationFrame(step);
-    }
-
-    function setupEventListeners() {
-      // Tier buttons
-      document.querySelectorAll('[data-tier]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('[data-tier]').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          currentTier = btn.getAttribute('data-tier');
-          selectStep(currentStepIndex);
-        });
-      });
-
-      // Theme buttons
-      document.querySelectorAll('[data-theme-btn]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('[data-theme-btn]').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          const theme = btn.getAttribute('data-theme-btn');
-          document.documentElement.setAttribute('data-theme', theme);
-        });
-      });
-
-      // Scenario buttons
-      document.querySelectorAll('.scenario-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-          document.querySelectorAll('.scenario-btn').forEach(b => b.classList.remove('active'));
-          btn.classList.add('active');
-          currentScenarioId = btn.getAttribute('data-scenario');
-          selectStep(0);
-        });
-      });
-
-      // Playback buttons
-      document.getElementById('btnNext').addEventListener('click', () => {
-        selectStep((currentStepIndex + 1) % DATA.nodes.length);
-      });
-      document.getElementById('btnPrev').addEventListener('click', () => {
-        selectStep((currentStepIndex - 1 + DATA.nodes.length) % DATA.nodes.length);
-      });
-      document.getElementById('btnReset').addEventListener('click', () => {
-        if (autoPlayInterval) clearInterval(autoPlayInterval);
-        document.getElementById('btnAutoPlay').textContent = 'Auto-Trace';
-        selectStep(0);
-      });
-      document.getElementById('btnAutoPlay').addEventListener('click', (e) => {
-        if (autoPlayInterval) {
-          clearInterval(autoPlayInterval);
-          autoPlayInterval = null;
-          e.target.textContent = 'Auto-Trace';
-        } else {
-          e.target.textContent = 'Pause';
-          autoPlayInterval = setInterval(() => {
-            selectStep((currentStepIndex + 1) % DATA.nodes.length);
-          }, 1500);
-        }
-      });
-
-      // Keyboard navigation
-      window.addEventListener('keydown', (e) => {
-        if (e.key === 'ArrowRight' || e.key === ' ') {
-          e.preventDefault();
-          selectStep((currentStepIndex + 1) % DATA.nodes.length);
-        } else if (e.key === 'ArrowLeft') {
-          e.preventDefault();
-          selectStep((currentStepIndex - 1 + DATA.nodes.length) % DATA.nodes.length);
-        } else if (e.key === '1') {
-          document.querySelector('[data-tier="low"]')?.click();
-        } else if (e.key === '2') {
-          document.querySelector('[data-tier="med"]')?.click();
-        } else if (e.key === '3') {
-          document.querySelector('[data-tier="high"]')?.click();
-        }
-      });
-    }
-
-    function truncate(str, len) {
-      return (str && str.length > len) ? str.slice(0, len) + '…' : str;
-    }
-
-    function escapeHtml(str) {
-      if (!str) return '';
-      return String(str)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
-    }
-  </script>
+<header class="bar">
+  <div class="brand"><span class="badge">explain-it</span><h1>${esc(flow.title)}</h1></div>
+  <span class="pill" title="Explanation depth" data-tier="${tier}">${TIERS[tier].button}</span>
+</header>
+<nav class="bar">
+  <div class="chips"><span class="caption">Walkthrough path</span>
+    ${scenarios.map(s => `<button data-scenario="${esc(s.id)}" aria-pressed="false" title="${esc(s.description || '')}">${esc(s.name)}</button>`).join('\n    ')}
+  </div>
+  <div class="controls">
+    <span class="count" id="stepBadge"></span>
+    <button id="btnPrev" title="Previous stage (←)">◀ Previous</button>
+    <button id="btnNext" class="primary" title="Next stage (Space / →)">Next ▶</button>
+    <button id="btnAuto">Auto-play</button>
+    <button id="btnReset">Reset</button>
+  </div>
+</nav>
+<main>
+  <section class="card-box">
+    <div class="card-head"><span>● How everything connects</span>
+      <span class="hint">Click a block or press <kbd>Space</kbd><kbd>→</kbd><kbd>←</kbd></span></div>
+    <div class="viewport" style="--min-w:${minWidth}px">${svg}</div>
+  </section>
+  ${flow.nodes.map((n, i) => stagePanel(n, i, flow.nodes.length, tier)).join('\n  ')}
+</main>
+<footer class="bar"><span>EXPLAIN-IT ARCHITECTURE TRACE</span><span>${esc(flow.concept || '')}</span></footer>
+<script>
+const SCENARIOS = ${JSON.stringify(scenarios).replace(/</g, '\\u003c')};
+${CLIENT_JS}
+</script>
 </body>
 </html>`;
 }
 
-function escapeHtml(str) {
-  if (!str) return '';
-  return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}
-
-// CLI Execution
+// CLI
 if (process.argv[1]?.endsWith('render-schematic.mjs')) {
-  const args = process.argv.slice(2);
-  let fixturePath = null;
-  let outPath = 'schematic.html';
-
-  for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--fixture' && args[i + 1]) {
-      fixturePath = args[i + 1];
-      i++;
-    } else if (args[i] === '--out' && args[i + 1]) {
-      outPath = args[i + 1];
-      i++;
-    }
-  }
-
-  if (!fixturePath) {
-    console.log('Usage: node render-schematic.mjs --fixture <flow.json> --out <output.html>');
+  const arg = name => { const i = process.argv.indexOf(name); return i > 1 ? process.argv[i + 1] : undefined; };
+  const fixture = arg('--fixture');
+  if (!fixture) {
+    console.log('Usage: node render-schematic.mjs --fixture <flow.json> --out <page.html> [--tier low|med|high] [--svg <overview.svg>]');
     process.exit(1);
   }
-
   try {
-    const raw = readFileSync(fixturePath, 'utf8');
-    const flowData = JSON.parse(raw);
-    const html = renderSchematicHtml(flowData);
-    writeFileSync(outPath, html, 'utf8');
-    console.log(`\n✨ Schematic successfully rendered to: ${outPath}`);
+    const out = arg('--out') || 'schematic.html';
+    const svgOut = arg('--svg') || out.replace(/\.html?$/i, '') + '.svg';
+    const flow = JSON.parse(readFileSync(fixture, 'utf8'));
+    const tier = resolveTier(arg('--tier') || flow.tier);
+    writeFileSync(out, renderSchematicHtml(flow, { tier }), 'utf8');
+    writeFileSync(svgOut, renderDiagramSvg(flow), 'utf8');
+    console.log(`\n✨ Interactive page (${tier} tier): ${out}\n🗺️  System overview SVG: ${svgOut}`);
   } catch (err) {
     console.error(`Error rendering schematic: ${err.message}`);
     process.exit(1);
