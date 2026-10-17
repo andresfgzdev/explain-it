@@ -1,87 +1,52 @@
 # Visual Schematic Specification
 
-This document defines the visual design system, aesthetic standards, and interactive mechanics for the `explain-it` software machine generator.
+This document defines what `render-schematic.mjs` produces and the rules that keep its output readable.
 
 ---
 
-## 1. Aesthetic Philosophy: The Software Machine
+## 1. Two artifacts, one diagram
 
-Inspired by the tactile craft of the *Anatomy* project, `explain-it` avoids sterile white boxes and generic flowchart arrows. Instead, it renders software architectures as a **living electronic test bench / digital machine**.
+Each render writes two files from the same SVG code:
 
-Key visual invariants:
-1. **Solids and Plates:** Every component or module is rendered as a distinct physical enclosure with header plates, status LEDs, and mounting rivets.
-2. **Signal Busses & Routed Cables:** Connections are routed cleanly using orthogonal or high-radius curved SVG paths. Signal pulses travel along the cables to show data in motion.
-3. **Logic Gates (Interlocks):** Validation rules are drawn as mechanical or electrical interlocks with two distinct outputs:
-   - **Forward Pass (Green/Cyan):** Signal continues down the pipeline.
-   - **Trip/Halt (Red/Amber):** Signal diverts into the error bus or rejection handler.
-4. **The Live Oscilloscope (Inspector):** A dedicated inspection panel updates in real time to show the exact ASD-STE100 description, code file, line numbers, and JSON payload for the currently selected stage.
-5. **No Text Clutter in Wires:** Labels stay neatly anchored to ports or inside node plates. Complex explanations live exclusively in the Inspector sidebar.
+| File | Purpose |
+|---|---|
+| `<name>.svg` | **System overview.** The whole connected system with title, concept, every node, every cable label, error branches, and a legend. Use it as an image in PRs, docs, or slides. |
+| `<name>.html` | **Interactive walkthrough.** It embeds the same diagram and adds scenario paths, step navigation, and a per-stage inspector. |
 
----
+Both files are fully pre-rendered and need no network access, fonts, or scripts from outside the file. The HTML uses a small script only to move between steps.
 
-## 2. Four Master Themes
+## 2. Layout rules
 
-All styles use CSS custom properties (`var(--bg)`, `var(--panel)`, `var(--accent)`, etc.) to support seamless instant switching:
+1. **Main path** nodes run left → right in array order.
+2. **Row wrap:** with more than 5 main nodes, the path wraps into balanced rows (7 → 4 + 3, 12 → 4 + 4 + 4). A cable leaves the end of a row on the right, runs back through the gap above the next row, and enters the first card from the left.
+3. **Error lane:** each `error` node sits directly below the node that rejects into it. If two errors share a column, the second one moves one column to the right.
+4. **Cable labels never overlap cards:**
+   - Horizontal cables have a 130px gap. Labels wrap at 18 characters per line, 2 lines maximum, and sit above the line.
+   - Vertical (error) labels sit to the right of the line.
+   - Every label has a halo in the background color, so a crossing line does not hide it.
+5. **Skip or back edges** on the same row arc over the top of the cards.
+6. Card text wraps or clips to fixed widths. The full label, subtitle, and code ref are in the card's `<title>` tooltip.
 
-### Theme 1: Industrial Blueprint (Default)
-* Background: `#08131e` with subtle `#0f2b42` millimeter grid
-* Panel Base: `#0e2233` with `#1d4260` borders
-* Active Accent: `#00f0ff` (Cyan LED glow)
-* Success Wire: `#00e5a3` (Mint Emerald)
-* Error / Reject: `#ff3b5c` (Signal Crimson)
-* Typography: Space Mono, JetBrains Mono, or clean monospace headers with Inter/system sans for body.
+## 3. Visual language
 
-### Theme 2: Technical Ledger / Paper
-* Background: `#f7f4ed` with subtle warm ledger grid
-* Panel Base: `#ffffff` with `#d3cbbe` solid mechanical borders
-* Active Accent: `#d9531e` (Draftsman Orange)
-* Success Wire: `#1e7e58` (Forest Ink)
-* Error / Reject: `#b82424` (Stamp Red)
-* Typography: Classic IBM Plex Sans or serif accents with crisp monospace code.
+| Element | Style |
+|---|---|
+| Card | White surface, 1.5px neutral border, header strip with `NN · TYPE` tag |
+| Error card | Red border, red-tinted header, red tag |
+| Main cable | 1.75px neutral line with arrowhead |
+| Error cable | Dashed red line with red arrowhead |
+| Active card / lit cable (HTML) | Dark 2.4px border / dark 2.6px line |
+| Off-path nodes in current scenario (HTML) | 25% opacity |
 
-### Theme 3: Stealth Dark
-* Background: `#0d0f12` matte obsidian
-* Panel Base: `#16191f` with `#272c37` borders
-* Active Accent: `#6366f1` (Indigo glow)
-* Success Wire: `#10b981` (Emerald)
-* Error / Reject: `#f43f5e` (Rose)
-* Typography: Inter & Fira Code.
+- Typography uses the system UI font for prose and the system monospace font for tags, code refs, and labels.
+- The HTML page supports light and dark mode through `prefers-color-scheme`. The SVG reads the same CSS variables and falls back to light colors when it is a standalone image.
 
-### Theme 4: Laboratory Sepia
-* Background: `#1f1a14` deep sepia
-* Panel Base: `#2c251e` with `#453c30` brass borders
-* Active Accent: `#e5a93c` (Amber vacuum tube glow)
-* Success Wire: `#6eb071`
-* Error / Reject: `#cc4936`
-* Typography: Courier Prime / monospace vintage lab manual.
+## 4. Interaction (HTML)
 
----
-
-## 3. Node Classifications
-
-Every node in the system diagram belongs to one of five physical roles:
-
-| Node Role | Visual Metaphor | Attributes |
-|---|---|---|
-| `ingress` | Power Inlet / Signal Transmitter | Shows external origin (e.g. Salesforce Webhook, Client UI, Cron Timer). |
-| `interlock` | Circuit Breaker / Logic Gate | Enforces schema validation, auth token check, or boundary rules. Has PASS and TRIP outputs. |
-| `processor` | Computation Unit / Engine Core | Transforms payloads, calculates business rules, or dispatches jobs. |
-| `egress` | Output Terminal / Storage Vault | Writes to database, triggers third-party REST API, or enqueues message. |
-| `error_sink` | Shunt / Rejection Bin | Handles 4xx/5xx responses, dead-letter queues, or error alerts. |
-
----
-
-## 4. Interactive Simulation & Controls
-
-The visual machine must be fully controllable by the reader:
-
-* **State Injector:** Quick-select scenarios to test different execution paths:
-  - *Scenario A: Happy Path (200 OK)*
-  - *Scenario B: Authentication Failure (401)*
-  - *Scenario C: Schema Validation Rejection (422)*
-  - *Scenario D: Network/DB Timeout (504)*
-* **Step-by-Step Playback:**
-  - `[◀ Prev Step]` and `[Next Step ▶]` to step forward one hop at a time.
-  - `[Play Auto-Trace]` to let the data packet travel autonomously.
-* **Explanation Level Switcher:** Toggle between `Low`, `Medium`, and `High` in real time without reloading the page.
-* **Inspect on Hover / Click:** Clicking any node, gate, or wire immediately freezes simulation and populates the Oscilloscope Inspector.
+- **Depth tier:** the page shows **one** tier, picked at render time with `--tier`. It has no tier switcher, and the other tiers are not in the file.
+- **Scenarios:** each chip loads its `path`. Nodes and cables outside the path dim. Cables that the walkthrough already passed are lit.
+- **Navigation:**
+  - Click or press Enter on a card. If the card is not on the current path, the page switches to the first scenario that includes it.
+  - Space / → goes to the next step, ← goes to the previous step. The page also has Previous, Next, Auto-play, and Reset buttons.
+- **Pulse:** a dot travels along the cable into the new step. It is turned off when the user has `prefers-reduced-motion` set.
+- **Inspector:** shows the stage label, code ref, plain-English story, tier text, validations, failure behavior, and payload. All panels are pre-rendered, and the script only toggles `hidden`.

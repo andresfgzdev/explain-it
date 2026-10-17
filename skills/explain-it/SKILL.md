@@ -4,7 +4,7 @@ description: >
   Use when someone asks to explain how a component, service, feature, API, or multi-system integration works
   (e.g., frontend to backend, Salesforce to API, webhook to database, worker queues, event-driven flows);
   wants an explanation in ASD-STE100 (Simplified Technical English) at Low, Medium, or High depth;
-  or requests an interactive visual schematic / software machine diagram showing data paths, validations,
+  or requests an interactive visual schematic or system diagram showing data paths, validations,
   and failure cases. Not for generating new boilerplate code or running arbitrary refactors.
 license: MIT
 compatibility: Node.js 18+, any repository or software architecture.
@@ -12,84 +12,94 @@ compatibility: Node.js 18+, any repository or software architecture.
 
 # explain-it
 
-Explain any software architecture, feature, or cross-system pipeline in strict **ASD-STE100 (Simplified Technical English)** and render it as an **interactive, tactile software machine schematic**.
+Explain a software architecture, feature, or cross-system pipeline in strict **ASD-STE100 (Simplified Technical English)**. Then render it as a **system overview SVG** and an **interactive HTML walkthrough**.
 
-Every explanation is mathematically clear, active-voice, and free of ambiguous jargon. In High tier, every point is simplified to the maximum limit without loss of technical direction or meaning.
-
-Scripts live in `${CLAUDE_SKILL_DIR}/scripts/`.
+Scripts live in `${CLAUDE_SKILL_DIR}/scripts/`. References live in `${CLAUDE_SKILL_DIR}/references/`.
 
 ---
 
-## Interactive Requirements & Options
+## Defaults: do not interrogate the user
 
-Do not assume a default visual output. Ask or confirm with the user:
+Use these defaults unless the request says otherwise. Ask **one** question only when the target system itself is ambiguous.
 
-### 1. Visual Presentation Mode:
-1. **Interactive HTML Software Machine (Recommended):** Standalone, zero-dependency HTML file with animated signal cables, scenario injector (`200 OK`, `401 Unauthorized`, `422 Validation`, `504 Timeout`), live oscilloscope inspector, and four craft themes (Blueprint, Paper Ledger, Stealth Dark, Lab Sepia).
-2. **SVG Blueprint Card:** Standalone vector graphic suitable for embedding into GitHub PR descriptions or architecture documents.
-3. **Terminal ASCII / Unicode Wireframe:** Text-based schematic rendered directly in the console.
-4. **Markdown Text Only:** ASD-STE100 formatted text report without graphic artifacts.
+| Option | Default | Other values |
+|---|---|---|
+| Output | **HTML walkthrough + SVG overview** | `svg` only · `ascii` (box-drawing schematic in chat) · `text` (Markdown only) |
+| Tier | **Medium** | Low · High. Map "quick/summary" → low, "steps/how" → med, "deep/everything/all details" → high |
 
-### 2. Explanation Depth Tier:
-* **Low (Executive Overview):** 2–3 sentence high-level orientation.
-* **Medium (Operational Breakdown):** Sequenced step-by-step procedural breakdown of inputs, actions, and outputs.
-* **High (Deep Technical Anatomy):** Exhaustive technical breakdown. Every validation, payload contract, edge case, and code pointer simplified to the maximum without loss of technical precision.
+Use **one tier** for everything: the chat explanation and the HTML. The HTML has no tier switcher.
+
+### What each tier contains
+
+| Tier | Chat explanation | Per-node `ste100` text |
+|---|---|---|
+| **Low** (executive) | 2–3 sentences for the whole system | 1–2 sentences: what the stage does |
+| **Medium** (steps) | Numbered steps, one per hop: actor → action → output | One procedural sentence (≤ 20 words) |
+| **High** (deep) | Steps plus contracts, validations, failure paths, and `file:line` refs | ≤ 6 descriptive sentences (≤ 25 words each): mechanism, contract, failure |
 
 ---
 
-## Step 1: Multi-Hop Discovery & Trace
+## Step 1: Trace the pipeline
 
-Do not limit analysis to simple frontend-to-backend hops. Map the complete multi-system pipeline:
+Map the complete flow, not only the first frontend-to-backend hop:
 
-1. **Ingress (Signal Source):**
-   - User action, UI component, Cron trigger, Salesforce Outbound Message, Webhook, or Message Queue topic.
-2. **Interlocks (Gates & Checks):**
-   - Signature checks (HMAC), authentication guards, schema validators (Zod/Yup/Pydantic), rate limiters.
-3. **Processing (Core Logic):**
-   - Service handlers, state machines, data transformers, business calculation rules.
-4. **Egress (Storage & External Sinks):**
-   - Database mutations (SQL/Prisma), third-party APIs (Salesforce REST, Stripe), external message dispatches.
-5. **Error & Rejection Branches:**
-   - Validation failures (422), unauthenticated requests (401), downstream timeouts (504), dead-letter queues.
+1. **Ingress:** the user action, route, webhook, cron job, or queue consumer that starts the flow.
+2. **Interlocks:** signature/auth checks, schema validators (Zod/Yup/Pydantic), rate limiters.
+3. **Processing:** services, state machines, transformers, business rules.
+4. **Egress:** database writes, third-party APIs, outbound messages.
+5. **Rejections:** every place the flow can stop (401, 422, 504, dead-letter queue). Each one becomes an `error` node.
 
-You can use the helper script to assist in candidate discovery:
+Start with the scanner. It lists candidate files with the line number of each hop:
+
 ```bash
-node ${CLAUDE_SKILL_DIR}/scripts/trace-flow.mjs <target-directory>
+node ${CLAUDE_SKILL_DIR}/scripts/trace-flow.mjs <target-directory>     # add --json for machine output
 ```
 
----
+The scanner only finds candidates. **Read the files** to confirm each hop and to get exact `file:line` references.
 
-## Step 2: Formulate ASD-STE100 Content
+## Step 2: Write the flow model
 
-Follow the strict rules in `references/ste100-rules.md`:
+Write `<scratch>/flow-<id>.json`. It must follow **`references/flow-schema.md`**. Copy the structure of `references/example-flow.json`.
 
-1. **Procedural sentences:** Maximum 20 words per sentence.
-2. **Descriptive sentences:** Maximum 25 words per sentence.
-3. **Active voice only:** Identify who or what performs the action ("The gateway validates the token", NOT "The token is validated by the gateway").
-4. **No unapproved vocabulary:** Use *use* (not *utilize*), *show* (not *display*), *start* (not *initiate*), *stop* (not *terminate*), *run* (not *execute*), *make* (not *fabricate*), *send* (not *transmit*), *get* (not *acquire*).
-5. **No noun clusters:** Maximum 3 consecutive nouns.
+Checklist:
+- One node per real hop. Use `type: "error"` nodes for rejections, connected from the stage that rejects.
+- `codeRef` uses `path/file.ts:LINE` for every node in the codebase.
+- Fill `ste100.<tier>` for the chosen tier on every node. The other tiers are optional.
+- Add `story` (plain-English analogy) when the audience is not technical.
+- Give each connection a short `label` (≤ 18 characters per line) that names what travels on it.
+- Add one `scenario` per meaningful path, with an ordered `path`. Always include the happy path.
 
----
+Write all STE100 text with the rules in `references/ste100-rules.md`:
+- Active voice only.
+- Approved words only (*use*, *show*, *start*, *stop*, *run*, *send*, *get*, *do*, *make sure*).
+- No more than 3 nouns in a row.
 
-## Step 3: Render the Visual Artifact
+## Step 3: Lint
 
-When the user selects **Interactive HTML Machine**:
-1. Assemble the flow model JSON in the session scratchpad (`<scratch>/flow-<id>.json`).
-2. Run the visual schematic generator:
 ```bash
-node ${CLAUDE_SKILL_DIR}/scripts/render-schematic.mjs --fixture <scratch>/flow-<id>.json --out <scratch>/schematic-<id>.html
+node ${CLAUDE_SKILL_DIR}/scripts/ste100-lint.mjs <scratch>/flow-<id>.json   # every ste100 field, per-tier limits
+node ${CLAUDE_SKILL_DIR}/scripts/ste100-lint.mjs <scratch>/explanation.md   # the chat explanation, if long
 ```
-3. Inform the user where the HTML artifact is saved so they can open it in any browser or preview window.
 
-When the user selects **Terminal ASCII / Unicode Wireframe**:
-Output a clean, box-drawing schematic directly in the conversation.
+Fix every error. Fix warnings (noun clusters) when the fix keeps the meaning.
 
----
+## Step 4: Render
 
-## Step 4: Verification
-
-Before finalizing, verify ASD-STE100 compliance using the linter:
 ```bash
-node ${CLAUDE_SKILL_DIR}/scripts/ste100-lint.mjs <scratch>/explanation.md
+node ${CLAUDE_SKILL_DIR}/scripts/render-schematic.mjs --fixture <scratch>/flow-<id>.json --out <scratch>/explain-<id>.html --tier <low|med|high>
 ```
-Fix any flagged passive voice, long sentences, or unapproved vocabulary.
+
+This writes `explain-<id>.html` (interactive walkthrough) and `explain-<id>.svg` (whole-system overview). Use `--svg <path>` to choose another SVG path. The renderer validates the model first. If it lists problems, fix the JSON and run it again.
+
+- **`svg` mode:** render as above and give only the SVG.
+- **`ascii` mode:** draw a box-drawing schematic directly in chat. Keep error branches below the main path.
+- **`text` mode:** skip rendering.
+
+## Step 5: Deliver
+
+1. Open the result for the user:
+   - Windows: `start "" <file>`
+   - macOS: `open <file>`
+   - Linux: `xdg-open <file>`
+2. Give the tier explanation in chat, in the same tier as the HTML.
+3. Give the absolute paths of the HTML and SVG files.
