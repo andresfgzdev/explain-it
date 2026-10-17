@@ -7,7 +7,9 @@
   "scripts": {
     "test": "node tests/run-tests.mjs",
     "lint:ste100": "node skills/explain-it/scripts/ste100-lint.mjs",
-    "demo": "node skills/explain-it/scripts/render-schematic.mjs --fixture tests/fixtures/sample-flow.json --out dist/demo-schematic.html"
+    "demo": "node skills/explain-it/scripts/render-schematic.mjs --fixture tests/fixtures/sample-flow.json --out dist/demo-schematic.html --tier high",
+    "demo:docs-site": "node skills/explain-it/scripts/render-schematic.mjs --fixture tests/fixtures/docs-site-flow.json --out dist/docs-site-schematic.html --tier med",
+    "trace": "node skills/explain-it/scripts/trace-flow.mjs"
   },
   "keywords": [
     "claude-skill",

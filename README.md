@@ -2,30 +2,31 @@
 
 An agent skill for **Claude Code** and modern AI coding assistants that explains software architectures, codebases, and multi-system integrations in strict **ASD-STE100 (Simplified Technical English)**, accompanied by an interactive **Software Machine schematic**.
 
-Inspired by the tactile craft of [Anatomy](https://skills.wheresryan.sh/anatomy), `explain-it` avoids generic flowchart boxes and arrows. It renders your architecture as a physical test bench with interactive signal cables, validation gates, scenario injectors, and live payload oscilloscopes.
+Inspired by the tactile craft of [Anatomy](https://skills.wheresryan.sh/anatomy), `explain-it` renders your architecture as a connected system of cards and labelled signal cables. The main path runs left to right, error branches drop into a lane below, and a step-by-step walkthrough lets you trace each scenario.
 
 ---
 
 ## Key Features
 
 1. **Strict ASD-STE100 Compliance:**
-   - Limits sentence length (max 20 words for instructions, max 25 words for descriptions).
-   - Enforces active voice and eliminates ambiguous technical vocabulary (uses *use*, *show*, *start*, *run*, *send*, *get*).
-   - Guarantees zero cognitive bloat without losing any technical precision.
+   - Limits sentence length (max 20 words for procedures, max 25 words for descriptions).
+   - Enforces active voice (with or without "by") and approved vocabulary (*use*, *show*, *start*, *run*, *send*, *get*), and warns on noun clusters.
+   - Lints whole flow models per tier: `ste100-lint.mjs flow.json`.
 
-2. **Three Explanation Tiers:**
-   - **Low (Executive Overview):** 2–3 sentence high-level orientation.
-   - **Medium (Operational Breakdown):** Sequenced step-by-step procedural breakdown of inputs, actions, and outputs.
-   - **High (Deep Technical Anatomy):** Exhaustive technical breakdown. Every validation, payload contract, edge case, and code pointer simplified to the maximum without loss of technical precision.
+2. **One tier per explanation:**
+   - **Low (Executive Overview):** 1–2 sentences per stage.
+   - **Medium (Operational Breakdown):** one procedural step per hop. This is the default.
+   - **High (Deep Technical Anatomy):** contracts, validations, failure paths, and `file:line` references.
+   - The tier you pick is the only tier in the chat answer and in the HTML.
 
-3. **Multi-Hop Signal Pipeline Discovery:**
-   - Traces entire cross-system flows: UI components → API Gateways → Schema Validations (Zod/Yup) → Async Workers → Databases → Third-party integrations (Salesforce, Stripe, AWS).
+3. **Multi-Hop Pipeline Discovery:**
+   - `trace-flow.mjs` finds routes, webhooks, queue consumers, validators, auth checks, DB queries, and third-party calls, with line numbers.
 
-4. **Standalone "Software Machine" Schematic:**
-   - 100% zero-dependency, self-contained single HTML/SVG file.
-   - Four craft themes: **Industrial Blueprint**, **Paper Ledger**, **Stealth Dark**, and **Laboratory Sepia**.
-   - Interactive State Injector: test `200 Success`, `401 Unauthorized`, `422 Validation Error`, or `504 Timeout`.
-   - Real-time Oscilloscope Inspector showing live payloads, code lines, and active validations.
+4. **Two artifacts per render, both offline and dependency-free:**
+   - **System overview SVG:** the whole connected system with labelled cables, error branches, and a legend, ready for PRs and docs.
+   - **Interactive HTML walkthrough:** scenario paths (for example `200 OK`, `401`, `422`, `504`), step navigation, an animated signal pulse, and a per-stage inspector with code refs, rules, failure behavior, and payloads. Supports light and dark mode.
+
+5. **Validated flow model:** a documented JSON schema (`references/flow-schema.md`). The renderer reports every problem before it renders.
 
 ---
 
@@ -63,15 +64,21 @@ Or invoke directly in Claude Code:
 
 ## Verification & Testing
 
-Run the automated test suite to verify the ASD-STE100 linter, schematic generator, and multi-hop scanner:
+Run the automated test suite. It checks the ASD-STE100 linter, flow validation, layout geometry, both renderers for every fixture and tier, and the multi-hop scanner:
 
 ```bash
 npm test
 ```
 
-Generate the demo schematic:
+Generate the demo artifacts (HTML + SVG in `dist/`):
 ```bash
-npm run demo
+npm run demo            # Salesforce → PostgreSQL sample, with error branches
+npm run demo:docs-site  # 7-stage static docs site pipeline, wraps into two rows
+```
+
+Render your own flow model:
+```bash
+node skills/explain-it/scripts/render-schematic.mjs --fixture flow.json --out dist/flow.html --tier med
 ```
 
 ---
